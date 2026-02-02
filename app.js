@@ -283,12 +283,15 @@ function renderTabellaArticoli(){
 
         <td data-col="totaleNetto" data-out="totale">€${fmtEur(c.totale)}</td>
 
-        <td data-col="trasporto">
-          <div style="display:flex; gap:6px; align-items:center;">
-            <input style="width:92px" data-k="costoTrasporto" data-i="${idx}" value="${fmtEur(parseDec(a.costoTrasporto))}" inputmode="decimal">
-            <button type="button" data-action="calc_tr" data-i="${idx}">Calcola</button>
-          </div>
-        </td>
+        
+<td data-col="trasporto">
+  <div class="tr-inline">
+    <input class="tr-input" style="width:92px"
+      data-k="costoTrasporto" data-i="${idx}"
+      value="${fmtEur(parseDec(a.costoTrasporto))}" inputmode="decimal">
+    <button class="tr-btn" type="button" data-action="calc_tr" data-i="${idx}">Calcola</button>
+  </div>
+</td>
 
         <td data-col="installazione">
           <input data-k="costoInstallazione" data-i="${idx}" value="${fmtEur(parseDec(a.costoInstallazione))}" inputmode="decimal">

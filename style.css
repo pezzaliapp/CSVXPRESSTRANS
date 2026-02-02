@@ -257,7 +257,7 @@ button:active{ transform: translateY(1px); }
 #articoli-table td[data-col="totaleNetto"]{ width: 95px; }
 
 #articoli-table th[data-col="trasporto"],
-#articoli-table td[data-col="trasporto"]{ width: 95px; }
+#articoli-table td[data-col="trasporto"]{ width: 165px; }
 
 #articoli-table th[data-col="installazione"],
 #articoli-table td[data-col="installazione"]{ width: 85px; }
@@ -302,4 +302,30 @@ button:active{ transform: translateY(1px); }
 
   /* su mobile mantieni comunque scorrimento */
   #articoli-table{ min-width: 980px; }
+}
+/* =========================
+   CSVXPRESSTRANS — Trasporto button visibility
+   ========================= */
+#articoli-table td[data-col="trasporto"]{
+  white-space: normal;       /* consenti wrap per input+bottone */
+}
+#articoli-table td[data-col="trasporto"] .tr-inline{
+  display:flex;
+  gap:8px;
+  align-items:center;
+  justify-content:flex-start;
+  flex-wrap:wrap;
+}
+#articoli-table td[data-col="trasporto"] .tr-input{
+  width:92px;
+  max-width:120px;
+}
+#articoli-table td[data-col="trasporto"] .tr-btn{
+  display:inline-flex !important;
+  align-items:center;
+  justify-content:center;
+  padding:0.42em 0.55em;
+  border-radius:10px;
+  font-weight:700;
+  white-space:nowrap;
 }
