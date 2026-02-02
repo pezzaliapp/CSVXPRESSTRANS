@@ -1,0 +1,22 @@
+{
+  "ABRUZZO": ["AQ", "CH", "PE", "TE"],
+  "BASILICATA": ["MT", "PZ"],
+  "CALABRIA": ["CS", "CZ", "KR", "RC", "VV"],
+  "CAMPANIA": ["AV", "BN", "CE", "NA", "SA"],
+  "EMILIA + SAN MARINO": ["BO", "FC", "FE", "MO", "PC", "PR", "RA", "RE", "RN"],
+  "FRIULI": ["GO", "PN", "TS", "UD"],
+  "LAZIO": ["FR", "LT", "RI", "RM", "VT"],
+  "LIGURIA": ["GE", "IM", "SP", "SV"],
+  "LOMBARDIA": ["BG", "BS", "CO", "CR", "LC", "LO", "MB", "MI", "MN", "PV", "SO", "VA"],
+  "MARCHE": ["AN", "AP", "FM", "MC", "PU"],
+  "MOLISE": ["CB", "IS"],
+  "PIEMONTE": ["AL", "AT", "BI", "CN", "NO", "TO", "VC", "VB"],
+  "PUGLIA": ["BA", "BR", "BT", "FG", "LE", "TA"],
+  "SARDEGNA": ["CA", "NU", "OR", "SS", "SU"],
+  "SICILIA": ["AG", "CL", "CT", "EN", "ME", "PA", "RG", "SR", "TP"],
+  "TOSCANA": ["AR", "FI", "GR", "LI", "LU", "MS", "PI", "PO", "PT", "SI"],
+  "TRENTINO": ["BZ", "TN"],
+  "UMBRIA": ["PG", "TR"],
+  "VALLE D'AOSTA": ["AO"],
+  "VENETO": ["BL", "PD", "RO", "TV", "VE", "VI", "VR"]
+}
