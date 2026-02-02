@@ -1,0 +1,345 @@
+<!doctype html>
+<html lang="it">
+<head>
+  <meta charset="utf-8" />
+  <!-- iOS/Android: safe area + scaling ok -->
+  <meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover" />
+  <title>Trasporti — Calcolo automatico</title>
+
+  <link rel="manifest" href="manifest.json">
+  <meta name="theme-color" content="#111111">
+  <link rel="stylesheet" href="styles.css">
+
+  <!-- iOS PWA hints -->
+  <meta name="apple-mobile-web-app-capable" content="yes">
+  <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+
+  <!-- Device mode: aggiunge .is-mobile o .is-desktop a <html> (solo UI) -->
+  <script>
+    (function(){
+      const isMobile =
+        window.matchMedia && window.matchMedia("(hover:none) and (pointer:coarse)").matches ||
+        Math.min(window.innerWidth, window.innerHeight) < 900;
+
+      document.documentElement.classList.toggle("is-mobile", !!isMobile);
+      document.documentElement.classList.toggle("is-desktop", !isMobile);
+
+      // Collassa Batch di default su mobile
+      window.__PWA_IS_MOBILE__ = !!isMobile;
+    })();
+  </script>
+
+  <!-- Google tag (gtag.js) -->
+  <script async src="https://www.googletagmanager.com/gtag/js?id=G-D0Y0T3JH6K"></script>
+  <script>
+    window.dataLayer = window.dataLayer || [];
+    function gtag(){dataLayer.push(arguments);}
+    gtag('js', new Date());
+    gtag('config', 'G-D0Y0T3JH6K');
+  </script>
+
+  <!-- Microsoft Clarity -->
+  <script type="text/javascript">
+      (function(c,l,a,r,i,t,y){
+          c[a]=c[a]||function(){(c[a].q=c[a].q||[]).push(arguments)};
+          t=l.createElement(r);t.async=1;t.src="https://www.clarity.ms/tag/"+i;
+          y=l.getElementsByTagName(r)[0];y.parentNode.insertBefore(t,y);
+      })(window, document, "clarity", "script", "v8o4vl5wxo");
+  </script>
+
+  <style>
+    .share-actions{display:flex; gap:10px; margin-top:10px; flex-wrap:wrap;}
+    .share-actions .sharebtn{
+      border:0;
+      padding:10px 14px;
+      border-radius:12px;
+      font-weight:700;
+      cursor:pointer;
+    }
+    .share-actions .sharebtn:disabled{opacity:.45; cursor:not-allowed;}
+    .share-actions .btn-native{background:#b28cff; color:#111;}
+    .share-actions .btn-wa{background:#25D366; color:#111;}
+    .share-actions .btn-txt{background:#4da3ff; color:#111;}
+  </style>
+
+</head>
+<body>
+  <header class="topbar">
+    <div class="brand">
+      <div class="dot"></div>
+      <div>
+        <div class="title">Trasporti</div>
+        <div class="subtitle">Calcolo automatico costi (PWA)</div>
+      </div>
+    </div>
+
+    <div class="topbar-right">
+      <div class="status" id="pwaStatus">Offline-ready: …</div>
+
+      <!-- Mini-nav solo mobile (scorciatoie) -->
+      <nav class="quicknav" aria-label="Sezioni">
+        <a class="qbtn" href="#sec-dati">Dati</a>
+        <a class="qbtn" href="#sec-risultato">Risultato</a>
+        <a class="qbtn" href="#sec-batch">Batch</a>
+      </nav>
+    </div>
+  </header>
+
+  <main class="wrap">
+    <!-- DATI SPEDIZIONE -->
+    <section class="card" id="sec-dati">
+      <h2>Dati spedizione</h2>
+
+      <div class="grid">
+        <label class="field">
+          <span>Servizio</span>
+          <select id="service">
+            <option value="PALLET">Bancale (costi max per Regione)</option>
+            <option value="GROUPAGE">Groupage / Parziale</option>
+          </select>
+          <div class="hint">
+            Nota: macchine tipo equilibratrici / smontagomme / ponti → tipicamente <b>Bancale</b>.
+          </div>
+        </label>
+
+        <label class="field">
+          <span>Destinazione (Regione)</span>
+          <select id="region"></select>
+        </label>
+
+        <label class="field" id="provinceField">
+          <span>Destinazione (Provincia)</span>
+          <select id="province"></select>
+        </label>
+
+        <label class="field">
+          <span>Ricerca articolo</span>
+          <input id="q" type="search" placeholder="Es. MEC 820VDL / Cormach / CASCOS..." autocomplete="off" />
+        </label>
+
+        <label class="field">
+          <span>Articolo</span>
+          <select id="article"></select>
+        </label>
+
+        <label class="field">
+          <span>Quantità</span>
+          <input id="qty" type="number" min="1" step="1" value="1" inputmode="numeric">
+        </label>
+
+        <label class="field" id="palletTypeField">
+          <span>Taglia bancale</span>
+          <select id="palletType"></select>
+          <div class="hint">Auto-compilata dall’articolo (se presente), ma modificabile manualmente.</div>
+        </label>
+
+        <label class="field" id="lmField">
+          <span>Metri lineari (Groupage)</span>
+          <input id="lm" type="number" min="0" step="0.1" value="0" inputmode="decimal">
+        </label>
+
+        <label class="field" id="quintaliField">
+          <span>Quintali (Groupage)</span>
+          <input id="quintali" type="number" min="0" step="0.5" value="0" inputmode="decimal">
+        </label>
+
+        <label class="field" id="palletCountField">
+          <span>N° bancali (Groupage)</span>
+          <input id="palletCount" type="number" min="0" step="1" value="0" inputmode="numeric">
+        </label>
+
+        <!-- KM + DISAGIATA -->
+        <label class="field">
+          <span>Distanza oltre capoluogo (km)</span>
+          <input id="kmOver" type="number" min="0" step="1" value="0" inputmode="numeric">
+        </label>
+
+        <label class="field">
+          <span>Vincoli zona</span>
+          <div class="checks">
+            <label><input type="checkbox" id="optDisagiata"> Località disagiata / ZTL / isole minori</label>
+          </div>
+        </label>
+
+        <label class="field">
+          <span>Opzioni</span>
+          <div class="checks">
+            <label><input type="checkbox" id="optPreavviso"> Preavviso telefonico</label>
+            <label><input type="checkbox" id="optAssicurazione"> Assicurazione (3%)</label>
+            <label><input type="checkbox" id="optSponda"> Sponda (se prevista)</label>
+          </div>
+        </label>
+
+        <label class="field">
+          <span>Note extra (facoltative)</span>
+          <input id="extraNote" type="text" placeholder="Es. località disagiata, km oltre 30, consegna su appuntamento…">
+        </label>
+      </div>
+
+      <!-- Azioni: su mobile diventano “sticky” -->
+      <div class="actions">
+        <button id="btnCalc">Calcola</button>
+        <button id="btnCopy" class="secondary" disabled>Copia riepilogo</button>
+      </div>
+    </section>
+
+    <!-- BATCH / CONVERTITORI (collassabile su mobile) -->
+    <section class="card" id="sec-batch">
+      <div class="section-head">
+        <h2>Batch / Convertitori</h2>
+
+        <!-- Toggle solo UI (non tocca logica) -->
+        <label class="batch-toggle" for="toggleBatch" title="Mostra/Nascondi Batch">
+          <span class="batch-toggle-label">Apri</span>
+        </label>
+      </div>
+
+      <input type="checkbox" id="toggleBatch" class="toggleBatch" />
+
+      <div class="batch-body" id="batchBody">
+        <div class="grid">
+          <label class="field">
+            <span>Import CSV articoli → genera articles.json</span>
+            <input id="fileArticlesCsv" type="file" accept=".csv,text/csv" />
+            <div class="hint">Usa il template: <code>data/template_articles.csv</code></div>
+          </label>
+
+          <label class="field">
+            <span>Import CSV Regioni→Province → genera geo_provinces.json</span>
+            <input id="fileGeoCsv" type="file" accept=".csv,text/csv" />
+            <div class="hint">Formato: <code>region,province</code> (una riga per provincia)</div>
+          </label>
+
+          <label class="field">
+            <span>Import CSV offerta (righe) → calcola trasporto batch</span>
+            <input id="fileOfferCsv" type="file" accept=".csv,text/csv" />
+            <div class="hint">
+              Colonne minime consigliate:
+              <code>code,qty,service,region,province,palletType,lm,quintali,palletCount,kmOver,disagiata</code>
+              <br>
+              service ammessi: <code>PALLET</code> oppure <code>GROUPAGE</code>.
+            </div>
+          </label>
+
+          <label class="field">
+            <span>Output</span>
+            <div class="checks">
+              <label><input type="checkbox" id="batchPickCheapest" checked>
+                Se service vuoto → scegli costo min (PALLET vs GROUPAGE)
+              </label>
+              <label><input type="checkbox" id="batchUseArticlePallet" checked>
+                Se palletType vuoto → usa quello dell’articolo
+              </label>
+            </div>
+          </label>
+        </div>
+
+        <div class="actions">
+          <button id="btnExportArticles" class="secondary" disabled>Scarica articles.json</button>
+          <button id="btnExportGeo" class="secondary" disabled>Scarica geo_provinces.json</button>
+          <button id="btnRunBatch" disabled>Calcola batch</button>
+          <button id="btnExportBatch" class="secondary" disabled>Scarica batch_result.csv</button>
+        </div>
+
+        <div class="meta" style="margin-top:12px;">
+          <div class="label">Log batch</div>
+          <pre id="batchLog">—</pre>
+        </div>
+      </div>
+    </section>
+
+    <!-- RISULTATO -->
+    <section class="card" id="sec-risultato">
+      <h2>Risultato</h2>
+
+      <div class="result">
+        <div class="price">
+          <div class="label">Costo preventivato</div>
+          <div class="value" id="outCost">—</div>
+        </div>
+<div class="meta">
+          <div class="label">Riepilogo</div>
+          <pre id="outText">Carica dati…</pre>
+
+          <div class="share-actions">
+            <button id="btnShare" class="sharebtn btn-native" disabled>Condividi</button>
+            <button id="btnShareWA" class="sharebtn btn-wa" disabled>WhatsApp</button>
+            <button id="btnExportTxt" class="sharebtn btn-txt" disabled>TXT</button>
+          </div>
+        </div>
+      </div>
+
+      <div class="alerts" id="outAlerts"></div>
+    </section>
+
+    <!-- DIAGNOSTICA -->
+    <section class="card" id="sec-debug">
+      <h2>Diagnostica</h2>
+      <div class="small">
+        <div><b>Articolo:</b> <span id="dbgArticle">—</span></div>
+        <div><b>Regole:</b> <span id="dbgRules">—</span></div>
+        <div><b>Dataset:</b> <span id="dbgData">—</span></div>
+      </div>
+    </section>
+  </main>
+
+  <footer class="foot">
+  <span>PezzaliAPP style — PWA offline-first</span><br>
+  <small>
+    © Alessandro Pezzali – Proprietary software. Authorized use only.
+  </small>
+</footer>
+
+  <script>
+    // Collassa Batch di default su mobile + testo toggle
+    (function(){
+      const t = document.getElementById("toggleBatch");
+      const lbl = document.querySelector(".batch-toggle-label");
+      if(!t || !lbl) return;
+
+      if (window.__PWA_IS_MOBILE__) t.checked = false;
+      else t.checked = true;
+
+      const sync = () => { lbl.textContent = t.checked ? "Chiudi" : "Apri"; };
+      t.addEventListener("change", sync);
+      sync();
+    })();
+  </script>
+
+  <script>
+    // Auto-update PWA: forza check update + reload quando il nuovo SW prende controllo (robusto, anti-race)
+    (function () {
+      if (!("serviceWorker" in navigator)) return;
+
+      const KEY = "pwa_sw_reloaded";
+
+      // Reload quando cambia il controller (nuovo SW attivo e in controllo)
+      navigator.serviceWorker.addEventListener("controllerchange", () => {
+        if (sessionStorage.getItem(KEY) === "1") return;
+        sessionStorage.setItem(KEY, "1");
+        window.location.reload();
+      });
+
+      // Forza il check di aggiornamento appena la pagina è caricata
+      window.addEventListener("load", async () => {
+        try {
+          const reg = await navigator.serviceWorker.getRegistration();
+          if (reg) await reg.update();
+        } catch (e) { /* ignore */ }
+      });
+
+      // Fallback: se arriva anche il messaggio, ricarica (ma non dipende da questo)
+      navigator.serviceWorker.addEventListener("message", (event) => {
+        if (event.data && event.data.type === "SW_UPDATED") {
+          if (sessionStorage.getItem(KEY) === "1") return;
+          sessionStorage.setItem(KEY, "1");
+          window.location.reload();
+        }
+      });
+    })();
+  </script>
+
+  <!-- Logica invariata -->
+  <script src="app.js"></script>
+</body>
+</html>
