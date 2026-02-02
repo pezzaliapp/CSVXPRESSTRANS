@@ -93,7 +93,7 @@ function cartIsActive(){
 }
 
 function getArtById(id){
-  return DB.articles.find(a => a.id === id) || null;
+  return DB.articles.find(a => String(a.id) === String(id)) || null;
 }
 
 function artGroupageParams(art){
@@ -633,9 +633,33 @@ function renderArticleList(q){
   fillSelect(UI.article, items, { placeholder: "— Seleziona articolo —", valueKey:"id", labelKey:"label" });
 }
 
+
+// Prefill da querystring (es. ?q=PUMA%20CE...) — apre già l'articolo suggerito ma resta modificabile
+function prefillFromQuery(){
+  const params = new URLSearchParams(location.search);
+  const q = (params.get("q") || "").trim();
+  if(!q) return;
+
+  // imposta ricerca
+  if(UI.q){
+    UI.q.value = q;
+    renderArticleList(q);
+  }
+
+  // prova a selezionare automaticamente il primo risultato utile
+  // (placeholder è index 0)
+  setTimeout(() => {
+    if(UI.article && UI.article.options && UI.article.options.length > 1){
+      UI.article.selectedIndex = 1;
+      UI.article.dispatchEvent(new Event("change", { bubbles:true }));
+    }
+  }, 30);
+}
+
+
 function selectedArticle(){
   const id = UI.article.value;
-  return DB.articles.find(a => a.id === id) || null;
+  return DB.articles.find(a => String(a.id) === String(id)) || null;
 }
 
 function addAlert(title, text){
@@ -1275,6 +1299,7 @@ async function init(){
 
   // Articles
   renderArticleList("");
+  prefillFromQuery();
 
   // Groupage multi-carico UI (iniettato sotto il campo LM)
   ensureGroupageCartUI();
