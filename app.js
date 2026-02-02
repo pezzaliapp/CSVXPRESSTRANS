@@ -255,32 +255,52 @@ function renderTabellaArticoli(){
 
   tbody.innerHTML = articoliAggiunti.map((a, idx) => {
     const c = computeRow(a);
+
     return `
       <tr data-row="${idx}">
-        <td>${escapeHtml(a.codice)}</td>
-        <td>${escapeHtml(a.descrizione)}</td>
+        <td data-col="codice">${escapeHtml(a.codice)}</td>
+        <td data-col="descrizione">${escapeHtml(a.descrizione)}</td>
 
-        <td><input data-k="prezzoLordo" data-i="${idx}" value="${fmtEur(parseDec(a.prezzoLordo))}" inputmode="decimal"></td>
-        <td><input data-k="sconto" data-i="${idx}" value="${fmtEur(parseDec(a.sconto))}" inputmode="decimal"></td>
-        <td><input data-k="sconto2" data-i="${idx}" value="${fmtEur(parseDec(a.sconto2))}" inputmode="decimal"></td>
-        <td><input data-k="scontoCliente" data-i="${idx}" value="${fmtEur(parseDec(a.scontoCliente))}" inputmode="decimal"></td>
-        <td><input data-k="margine" data-i="${idx}" value="${fmtEur(parseDec(a.margine))}" inputmode="decimal"></td>
+        <td data-col="prezzoLordo">
+          <input data-k="prezzoLordo" data-i="${idx}" value="${fmtEur(parseDec(a.prezzoLordo))}" inputmode="decimal">
+        </td>
 
-        <td data-out="totale">€${fmtEur(c.totale)}</td>
+        <td data-col="sconto1">
+          <input data-k="sconto" data-i="${idx}" value="${fmtEur(parseDec(a.sconto))}" inputmode="decimal">
+        </td>
 
-        <td>
+        <td data-col="sconto2">
+          <input data-k="sconto2" data-i="${idx}" value="${fmtEur(parseDec(a.sconto2))}" inputmode="decimal">
+        </td>
+
+        <td data-col="scontoCliente">
+          <input data-k="scontoCliente" data-i="${idx}" value="${fmtEur(parseDec(a.scontoCliente))}" inputmode="decimal">
+        </td>
+
+        <td data-col="margine">
+          <input data-k="margine" data-i="${idx}" value="${fmtEur(parseDec(a.margine))}" inputmode="decimal">
+        </td>
+
+        <td data-col="totaleNetto" data-out="totale">€${fmtEur(c.totale)}</td>
+
+        <td data-col="trasporto">
           <div style="display:flex; gap:6px; align-items:center;">
             <input style="width:92px" data-k="costoTrasporto" data-i="${idx}" value="${fmtEur(parseDec(a.costoTrasporto))}" inputmode="decimal">
             <button type="button" data-action="calc_tr" data-i="${idx}">Calcola</button>
           </div>
         </td>
 
-        <td><input data-k="costoInstallazione" data-i="${idx}" value="${fmtEur(parseDec(a.costoInstallazione))}" inputmode="decimal"></td>
-        <td><input data-k="quantita" data-i="${idx}" value="${c.qta}" inputmode="numeric"></td>
+        <td data-col="installazione">
+          <input data-k="costoInstallazione" data-i="${idx}" value="${fmtEur(parseDec(a.costoInstallazione))}" inputmode="decimal">
+        </td>
 
-        <td data-out="grantot"><b>€${fmtEur(c.granTot)}</b></td>
+        <td data-col="qta">
+          <input data-k="quantita" data-i="${idx}" value="${c.qta}" inputmode="numeric">
+        </td>
 
-        <td>
+        <td data-col="granTot" data-out="grantot"><b>€${fmtEur(c.granTot)}</b></td>
+
+        <td data-col="azioni">
           <button type="button" data-action="del" data-i="${idx}">X</button>
         </td>
       </tr>
@@ -377,8 +397,11 @@ function onTableClick(e){
   }
 
   if(act === 'calc_tr'){
-    // apre la PWA trasporti separata (come hai richiesto)
-    window.open('./trasporti/', '_blank', 'noopener');
+    // apre la PWA trasporti separata, pre-compilando la ricerca articolo (sempre modificabile)
+    const a = articoliAggiunti[i];
+    const q = a ? `${a.codice} ${a.descrizione}`.trim() : '';
+    const url = `./trasporti/?q=${encodeURIComponent(q)}`;
+    window.open(url, '_blank', 'noopener');
     return;
   }
 }
