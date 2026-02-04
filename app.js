@@ -1,1340 +1,1262 @@
-/* Trasporti PWA — logica base + Batch/Convertitori + GEO + km/disagiata
-   - Carica JSON (articoli + tariffe + geo province)
-   - Calcolo: PALLET / GROUPAGE  (GLS disabilitato se non configurato)
-*/
+/* ===========================
+   CSVXpressSmart — app.js
+   Fix: decimali con virgola + report smart formattato + tabella stabile
+   + Feature: "Sconto Cliente" (flag) che sostituisce sconto1/sconto2/margine mantenendo invariato il prezzo finale
+   =========================== */
 
-const $ = (id) => document.getElementById(id);
+// Registra il Service Worker (PWA) — update robusto (iOS/Android/Desktop)
+// - registra con cache-bust (?v=...)
+// - check update ad ogni apertura
+// - attiva subito la nuova versione (skipWaiting via message)
+// - reload automatico quando cambia controller (una sola volta)
+if ('serviceWorker' in navigator) {
+  window.addEventListener('load', async () => {
+    const VER = document.documentElement.getAttribute('data-ver') || 'dev';
+    const SW_URL = `service-worker.js?v=${encodeURIComponent(VER)}`;
 
-let DB = {
-  articles: [],
-  palletRates: null,
-  groupageRates: null,
-};
+    try {
+      const reg = await navigator.serviceWorker.register(SW_URL);
+      console.log('Service Worker registrato', reg);
 
-let GEO = null; // geo_provinces.json (Regione -> Province)
+      try { await reg.update(); } catch (_) {}
 
-const UI = {
-  // Core
-  service: $("service"),
-  region: $("region"),
-  province: $("province"),
-  provinceField: $("provinceField"),
-  q: $("q"),
-  article: $("article"),
-  qty: $("qty"),
-  palletType: $("palletType"),
-  palletTypeField: $("palletTypeField"),
-  lm: $("lm"),
-  lmField: $("lmField"),
-  quintali: $("quintali"),
-  quintaliField: $("quintaliField"),
-  palletCount: $("palletCount"),
-  palletCountField: $("palletCountField"),
-
-  // New fields
-  kmOver: $("kmOver"),
-  optDisagiata: $("optDisagiata"),
-
-  optPreavviso: $("optPreavviso"),
-  optAssicurazione: $("optAssicurazione"),
-  optSponda: $("optSponda"),
-  extraNote: $("extraNote"),
-  btnCalc: $("btnCalc"),
-  btnCopy: $("btnCopy"),
-  btnShare: $("btnShare"),
-  btnShareWA: $("btnShareWA"),
-  btnExportTxt: $("btnExportTxt"),
-  outCost: $("outCost"),
-  outText: $("outText"),
-  outAlerts: $("outAlerts"),
-
-  dbgArticle: $("dbgArticle"),
-  dbgRules: $("dbgRules"),
-  dbgData: $("dbgData"),
-  pwaStatus: $("pwaStatus"),
-
-  // Batch / Convertitori
-  fileArticlesCsv: $("fileArticlesCsv"),
-  fileGeoCsv: $("fileGeoCsv"),
-  fileOfferCsv: $("fileOfferCsv"),
-  batchPickCheapest: $("batchPickCheapest"),
-  batchUseArticlePallet: $("batchUseArticlePallet"),
-  btnExportArticles: $("btnExportArticles"),
-  btnExportGeo: $("btnExportGeo"),
-  btnRunBatch: $("btnRunBatch"),
-  btnExportBatch: $("btnExportBatch"),
-  batchLog: $("batchLog"),
-};
-
-const MEM = {
-  generatedArticlesJSON: null,
-  generatedGeoJSON: null,
-  batchCSVResult: null
-};
-
-
-/* -------------------- GROUPAGE MULTI-CARICO (base + stackabili) -------------------- */
-/*
-  Obiettivo: per il groupage, poter aggiungere più articoli in un "carico" unico.
-  - scegli una BASE (pianale) -> determina i Metri Lineari a terra
-  - gli articoli "stackabili" non aumentano i LM a terra (ma sommano peso / bancali / quintali se presenti)
-  - gli articoli NON stackabili sommano LM a terra
-  - LM usati = max(LM base, somma LM non-stackabili)
-  - LM fatturati = arrotondamento a scatto (default 1.0m, leggibile da meta.lm_step se presente)
-
-  NOTA: non richiede modifiche a index.html: se gli elementi non esistono, li iniettiamo sotto al campo LM.
-*/
-
-const GROUPAGE_CART = []; // { artId, qty, stackable }
-let GROUPAGE_BASE_ID = null;
-
-function cartIsActive(){
-  return UI.service?.value === "GROUPAGE" && GROUPAGE_CART.length > 0;
-}
-
-function getArtById(id){
-  return DB.articles.find(a => a.id === id) || null;
-}
-
-function artGroupageParams(art){
-  // Ricava LM / quintali / bancali dall'articolo (rules.*) con fallback a 0
-  const r = art?.rules || {};
-  const lm = Number(r.groupageLm ?? 0) || 0;
-  const quintali = Number(r.groupageQuintali ?? 0) || 0;
-  const pallets = Number(r.groupagePalletCount ?? 0) || 0;
-  return { lm, quintali, pallets };
-}
-
-function groupageLmStep(){
-  const step = Number(DB.groupageRates?.meta?.lm_step ?? 1);
-  return (Number.isFinite(step) && step > 0) ? step : 1;
-}
-
-function roundUpToStep(v, step){
-  if(!Number.isFinite(v)) return 0;
-  const s = (Number.isFinite(step) && step > 0) ? step : 1;
-  return Math.ceil(v / s) * s;
-}
-
-function calcGroupageCartTotals(){
-  // Restituisce: { lmUsed, lmBill, quintaliTotal, palletsTotal, baseArt }
-  if(GROUPAGE_CART.length === 0){
-    return { lmUsed:0, lmBill:0, quintaliTotal:0, palletsTotal:0, baseArt:null };
-  }
-
-  const baseId = GROUPAGE_BASE_ID || GROUPAGE_CART[0].artId;
-  const baseEntry = GROUPAGE_CART.find(x => x.artId === baseId) || GROUPAGE_CART[0];
-  const baseArt = getArtById(baseEntry.artId);
-
-  // Base LM: trattiamo base come "una base fisica" (non moltiplichiamo per qty) perché in groupage tipicamente si ragiona per pianale.
-  // Se vuoi che qty moltiplichi LM base, basta cambiare lmBase = params.lm * baseEntry.qty
-  const baseParams = artGroupageParams(baseArt);
-  const lmBase = baseParams.lm;
-
-  let lmNonStack = 0;
-  let quintaliTotal = 0;
-  let palletsTotal = 0;
-
-  for(const it of GROUPAGE_CART){
-    const art = getArtById(it.artId);
-    const params = artGroupageParams(art);
-    const q = Math.max(1, parseInt(it.qty || 1, 10));
-
-    // Totali (somma)
-    quintaliTotal += (params.quintali * q);
-    palletsTotal += (params.pallets * q);
-
-    // LM a terra: solo per NON stackabili, esclusa la base
-    if(it.artId !== baseId){
-      if(!it.stackable){
-        lmNonStack += (params.lm * q);
-      }
-    }
-  }
-
-  const lmUsed = Math.max(lmBase, lmNonStack);
-  const lmBill = roundUpToStep(lmUsed, groupageLmStep());
-
-  return {
-    lmUsed: round2(lmUsed),
-    lmBill: round2(lmBill),
-    quintaliTotal: round2(quintaliTotal),
-    palletsTotal: round2(palletsTotal),
-    baseArt
-  };
-}
-
-/* -------------------- UI: BOX CARICO GROUPAGE (iniettato) -------------------- */
-
-function ensureGroupageCartUI(){
-  // Se non ho i campi base, esco
-  if(!UI.lmField || !$("groupageCartBox")){
-    // creo un box sotto LM
-    if(!UI.lmField) return;
-
-    const box = document.createElement("div");
-    box.id = "groupageCartBox";
-    box.className = "panel";
-    box.style.marginTop = "10px";
-    box.innerHTML = `
-      <div style="display:flex; gap:8px; align-items:center; flex-wrap:wrap;">
-        <b>Carico Groupage</b>
-        <button type="button" id="btnAddToCarico" class="btn">Aggiungi articolo</button>
-        <button type="button" id="btnClearCarico" class="btn btn-ghost">Svuota</button>
-      </div>
-
-      <div style="margin-top:8px; display:flex; gap:10px; flex-wrap:wrap; align-items:center;">
-        <label style="display:flex; gap:6px; align-items:center;">
-          Base (pianale):
-          <select id="caricoBaseSelect"></select>
-        </label>
-
-        <span style="opacity:.8;">
-          LM usati: <b id="caricoLmUsed">0</b> • LM fatturati: <b id="caricoLmBill">0</b> • q.li tot: <b id="caricoQuintali">0</b> • bancali tot: <b id="caricoPallets">0</b>
-        </span>
-      </div>
-
-      <div id="caricoList" style="margin-top:8px;"></div>
-
-      <div style="margin-top:8px; font-size:12px; opacity:.85;">
-        Suggerimento: scegli come <b>Base</b> il macchinario più lungo (es. PFA 50). Metti <b>stackabile</b> su ciò che “sale sopra” (equilibratrice, assetto).
-      </div>
-    `;
-    UI.lmField.appendChild(box);
-  }
-
-  // bind
-  const btnAdd = $("btnAddToCarico");
-  const btnClear = $("btnClearCarico");
-  const baseSel = $("caricoBaseSelect");
-
-  if(btnAdd && !btnAdd.__bound){
-    btnAdd.__bound = true;
-    btnAdd.addEventListener("click", () => {
-      const art = selectedArticle();
-      const qty = Math.max(1, parseInt(UI.qty?.value || "1", 10) || 1);
-      if(!art) return;
-
-      const defaultStackable = (art.rules?.stackable === false) ? false : true;
-
-      const found = GROUPAGE_CART.find(x => x.artId === art.id);
-      if(found){
-        found.qty += qty;
-      } else {
-        GROUPAGE_CART.push({ artId: art.id, qty, stackable: defaultStackable });
-      }
-
-      if(!GROUPAGE_BASE_ID) GROUPAGE_BASE_ID = art.id;
-
-      renderGroupageCart();
-      try{ onCalc(); }catch(e){}
-    });
-  }
-
-  if(btnClear && !btnClear.__bound){
-    btnClear.__bound = true;
-    btnClear.addEventListener("click", () => {
-      GROUPAGE_CART.splice(0, GROUPAGE_CART.length);
-      GROUPAGE_BASE_ID = null;
-      renderGroupageCart();
-      try{ onCalc(); }catch(e){}
-    });
-  }
-
-  if(baseSel && !baseSel.__bound){
-    baseSel.__bound = true;
-    baseSel.addEventListener("change", () => {
-      GROUPAGE_BASE_ID = baseSel.value || null;
-      renderGroupageCart();
-      try{ onCalc(); }catch(e){}
-    });
-  }
-
-  renderGroupageCart();
-}
-
-function renderGroupageCart(){
-  const box = $("groupageCartBox");
-  if(!box) return;
-
-  const baseSel = $("caricoBaseSelect");
-  const list = $("caricoList");
-  const elLmUsed = $("caricoLmUsed");
-  const elLmBill = $("caricoLmBill");
-  const elQ = $("caricoQuintali");
-  const elP = $("caricoPallets");
-
-  // Popola select base
-  if(baseSel){
-    baseSel.innerHTML = "";
-    const o0 = document.createElement("option");
-    o0.value = "";
-    o0.textContent = "—";
-    baseSel.appendChild(o0);
-
-    for(const it of GROUPAGE_CART){
-      const art = getArtById(it.artId);
-      if(!art) continue;
-      const opt = document.createElement("option");
-      opt.value = it.artId;
-      opt.textContent = `${art.code ? art.code + " — " : ""}${art.name || it.artId}`;
-      baseSel.appendChild(opt);
-    }
-    baseSel.value = GROUPAGE_BASE_ID || "";
-  }
-
-  // Lista
-  if(list){
-    if(GROUPAGE_CART.length === 0){
-      list.innerHTML = `<div style="opacity:.75;">Nessun articolo nel carico. (Solo GROUPAGE: puoi aggiungere più articoli.)</div>`;
-    } else {
-      const rows = GROUPAGE_CART.map((it, idx) => {
-        const art = getArtById(it.artId);
-        const label = art ? `${art.brand ? art.brand+" — " : ""}${art.name}${art.code ? " · "+art.code : ""}` : it.artId;
-        const isBase = (it.artId === (GROUPAGE_BASE_ID || GROUPAGE_CART[0].artId));
-        const stackChecked = it.stackable ? "checked" : "";
-        return `
-          <div style="display:flex; gap:8px; align-items:center; flex-wrap:wrap; padding:6px 0; border-bottom:1px solid rgba(0,0,0,.08);">
-            <span style="min-width:280px;"><b>${isBase ? "BASE" : ""}</b> ${escapeHtml(label)}</span>
-            <label style="display:flex; gap:6px; align-items:center;">
-              qta
-              <input type="number" min="1" step="1" value="${it.qty}" data-idx="${idx}" data-k="qty" style="width:72px;">
-            </label>
-            <label style="display:flex; gap:6px; align-items:center;">
-              stackabile
-              <input type="checkbox" ${stackChecked} data-idx="${idx}" data-k="stackable">
-            </label>
-            <button type="button" class="btn btn-ghost" data-idx="${idx}" data-k="rm">Rimuovi</button>
-          </div>
-        `;
-      }).join("");
-      list.innerHTML = rows;
-
-      // bind row events (delegation)
-      list.querySelectorAll("input,button").forEach(el => {
-        if(el.__bound) return;
-        el.__bound = true;
-
-        const idx = parseInt(el.getAttribute("data-idx"), 10);
-        const k = el.getAttribute("data-k");
-
-        if(k === "qty"){
-          el.addEventListener("input", () => {
-            const v = Math.max(1, parseInt(el.value || "1", 10) || 1);
-            GROUPAGE_CART[idx].qty = v;
-            renderGroupageCart();
-            try{ onCalc(); }catch(e){}
-          });
-        } else if(k === "stackable"){
-          el.addEventListener("change", () => {
-            GROUPAGE_CART[idx].stackable = !!el.checked;
-            renderGroupageCart();
-            try{ onCalc(); }catch(e){}
-          });
-        } else if(k === "rm"){
-          el.addEventListener("click", () => {
-            const removed = GROUPAGE_CART.splice(idx, 1);
-            if(removed && removed[0] && removed[0].artId === GROUPAGE_BASE_ID){
-              GROUPAGE_BASE_ID = GROUPAGE_CART[0]?.artId || null;
-            }
-            renderGroupageCart();
-            try{ onCalc(); }catch(e){}
-          });
-        }
+      reg.addEventListener('updatefound', () => {
+        const nw = reg.installing;
+        if (!nw) return;
+        nw.addEventListener('statechange', () => {
+          // nuovo SW pronto e c'è già un controller -> forza attivazione
+          if (nw.state === 'installed' && navigator.serviceWorker.controller) {
+            try { nw.postMessage({ type: 'SKIP_WAITING' }); } catch (_) {}
+          }
+        });
       });
-    }
-  }
 
-  // Totali
-  const t = calcGroupageCartTotals();
-  if(elLmUsed) elLmUsed.textContent = String(t.lmUsed || 0);
-  if(elLmBill) elLmBill.textContent = String(t.lmBill || 0);
-  if(elQ) elQ.textContent = String(t.quintaliTotal || 0);
-  if(elP) elP.textContent = String(t.palletsTotal || 0);
-}
-
-// semplice escape per label in HTML (evita problemi se nome ha < >)
-function escapeHtml(s){
-  return String(s||"").replace(/[&<>"]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
-}
-
-function moneyEUR(v){
-  if (v === null || v === undefined || Number.isNaN(v)) return "—";
-  return new Intl.NumberFormat("it-IT", { style:"currency", currency:"EUR" }).format(v);
-}
-
-/* -------------------- SHARE (WhatsApp + TXT) -------------------- */
-/*
-  Obiettivo: inviare un report "client-ready" con:
-  - Servizio / Destinazione / Carico (se groupage multi-carico) / Opzioni / Note extra (se presenti)
-  - Totale: PREZZO CLIENTE (già calcolato) — senza citare ricarico/margine
-*/
-
-function enableShareButtons(enabled){
-  if(UI.btnShare) UI.btnShare.disabled = !enabled;
-  if(UI.btnShareWA) UI.btnShareWA.disabled = !enabled;
-  if(UI.btnExportTxt) UI.btnExportTxt.disabled = !enabled;
-}
-
-function buildClientReadyReport(){
-    const clientPrice = (UI.outCost?.textContent || "").trim();
-  const raw = (UI.outText?.textContent || "").trim();
-
-  if(!raw || raw === "Carica dati…" || !clientPrice || clientPrice === "—") return "";
-
-  const lines = raw.split("\n").map(s => s.trim()).filter(Boolean);
-
-  const out = [];
-  out.push("*TRASPORTO — STIMA*");
-
-  for(const ln of lines){
-    const up = ln.toUpperCase();
-
-    if(up.startsWith("REGOLE:")) continue;
-    if(up.startsWith("ATTENZIONE:")) continue;
-        if(up.startsWith("COSTO STIMATO:")) continue;
-    if(up.startsWith("COSTO PREVENTIVATO:")) continue;
-
-    if(up.includes("PROVINCIA") && up.includes("TARIFFATA")) continue;
-    if(up.startsWith("NOTA:")) continue;
-    if(up.startsWith("NOTA / CONTROLLO")) continue;
-
-    if(up.startsWith("SERVIZIO:")){
-      out.push(`Servizio: ${ln.split(":").slice(1).join(":").trim()}`);
-      continue;
-    }
-    if(up.startsWith("DESTINAZIONE:")){
-      out.push(`Destinazione: ${ln.split(":").slice(1).join(":").trim()}`);
-      continue;
-    }
-    if(up.startsWith("CARICO:")){
-      out.push(`Carico: ${ln.split(":").slice(1).join(":").trim()}`);
-      continue;
-    }
-
-    if(ln.startsWith("-")){
-      let s = ln.replace(/^\-\s*/, "• ");
-      s = s.replace(/\s*\[stack\]\s*/ig, "");
-      s = s.replace(/\s*\[BASE\]\s*/ig, " (Base)");
-      s = s.replace(/\s+/g, " ").trim();
-      out.push(s);
-      continue;
-    }
-
-    if(up.startsWith("GROUPAGE:")){
-      const rest = ln.split(":").slice(1).join(":").trim();
-      out.push(`Dati: ${rest}`);
-      continue;
-    }
-
-    if(up.startsWith("OPZIONI:")){
-      const rest = ln.split(":").slice(1).join(":").trim();
-      out.push(`Opzioni: ${rest || "nessuna"}`);
-      continue;
-    }
-
-    out.push(ln);
-  }
-
-  out.push("");
-  out.push(`*TOTALE: ${clientPrice}*`);
-
-  return out.slice(0, 40).join("\n").trim();
-}
-
-
-function shareViaWhatsApp(text){
-  const url = `https://wa.me/?text=${encodeURIComponent(text)}`;
-  window.open(url, "_blank", "noopener");
-}
-
-
-async function shareNative(text){
-  // Web Share API (mobile / iOS PWA). Fallback: copia negli appunti.
-  try{
-    if(navigator.share){
-      await navigator.share({ title: "Trasporto — Stima", text });
-      return;
-    }
-  }catch(e){
-    // user cancelled or not available -> fallback
-  }
-  try{
-    await navigator.clipboard.writeText(text);
-    // feedback leggero (senza alert invasivi)
-    
-  }catch(e){
-    // ultimo fallback: prompt
-    window.prompt("Copia il testo:", text);
-  }
-}
-
-function downloadTxt(text){
-  const blob = new Blob([text], { type: "text/plain;charset=utf-8" });
-  const url = URL.createObjectURL(blob);
-
-  const a = document.createElement("a");
-  a.href = url;
-  const ts = new Date().toISOString().slice(0,19).replace(/[:T]/g,"-");
-  a.download = `trasporto-${ts}.txt`;
-  document.body.appendChild(a);
-  a.click();
-  a.remove();
-  URL.revokeObjectURL(url);
-}
-
-function wireShareButtons(){
-  // Mostra "Condividi" solo se supportato (o comunque utile come copia negli appunti)
-  if(UI.btnShare){
-    // Se Web Share API non c'è, il bottone funziona come "copia negli appunti"
-    UI.btnShare.textContent = navigator.share ? "Condividi" : "Copia";
-    if(!UI.btnShare.__bound){
-      UI.btnShare.__bound = true;
-      UI.btnShare.addEventListener("click", async () => {
-        const txt = buildClientReadyReport();
-        if(!txt) return;
-        await shareNative(txt);
+      // quando il nuovo SW prende controllo -> ricarica 1 volta
+      navigator.serviceWorker.addEventListener('controllerchange', () => {
+        if (sessionStorage.getItem('sw_reloaded')) return;
+        sessionStorage.setItem('sw_reloaded', '1');
+        window.location.reload();
       });
+    } catch (err) {
+      console.error('Service Worker non registrato', err);
     }
+  });
+}
+
+
+// Variabili globali
+let listino = [];
+let articoliAggiunti = [];
+let autoPopolaCosti = true;
+let mostraDettagliServizi = true;
+
+// -------------------- HELPERS NUMERICI (virgola/decimali) --------------------
+function parseDec(val) {
+  // accetta: "60,43" / "60.43" / "  60,43  " / "" -> 0
+  const s = String(val ?? '')
+    .trim()
+    .replace(/\s+/g, '')
+    .replace(',', '.');
+  const n = parseFloat(s);
+  return Number.isFinite(n) ? n : 0;
+}
+
+function fmtDec(num, decimals = 2, trim = true) {
+  if (!Number.isFinite(num)) return '';
+  let s = Number(num).toFixed(decimals);
+  if (trim) s = s.replace(/\.?0+$/, '');
+  return s.replace('.', ',');
+}
+
+function roundTwo(num) { return Math.round(num * 100) / 100; }
+function clamp(num, min, max) { return Math.max(min, Math.min(max, num)); }
+
+// Mantiene il valore "in digitazione" senza forzare formati mentre scrivi (evita che la virgola venga “mangiata”)
+function sanitizeDecimalTyping(str) {
+  let s = String(str ?? '');
+  // consenti solo numeri, - (inizio), virgola/punto
+  s = s.replace(/[^\d,.\-]/g, '');
+  // solo un eventuale '-' all’inizio
+  s = s.replace(/(?!^)-/g, '');
+  // se ci sono più separatori, tieni il primo e rimuovi gli altri
+  const firstSep = s.search(/[.,]/);
+  if (firstSep !== -1) {
+    const head = s.slice(0, firstSep + 1);
+    const tail = s.slice(firstSep + 1).replace(/[.,]/g, '');
+    s = head + tail;
+  }
+  return s;
+}
+
+// -------------------- CSV MEMORY (IndexedDB) --------------------
+const CSV_DB_NAME = 'csvxpresssmart_db_v1';
+const CSV_STORE = 'kv';
+const CSV_KEY = 'last_csv_payload';
+
+function openCsvDB() {
+  return new Promise((resolve, reject) => {
+    const req = indexedDB.open(CSV_DB_NAME, 1);
+    req.onupgradeneeded = () => {
+      const db = req.result;
+      if (!db.objectStoreNames.contains(CSV_STORE)) db.createObjectStore(CSV_STORE);
+    };
+    req.onsuccess = () => resolve(req.result);
+    req.onerror = () => reject(req.error);
+  });
+}
+
+async function idbSet(key, value) {
+  const db = await openCsvDB();
+  return new Promise((resolve, reject) => {
+    const tx = db.transaction(CSV_STORE, 'readwrite');
+    tx.objectStore(CSV_STORE).put(value, key);
+    tx.oncomplete = () => resolve();
+    tx.onerror = () => reject(tx.error);
+  });
+}
+
+async function idbGet(key) {
+  const db = await openCsvDB();
+  return new Promise((resolve, reject) => {
+    const tx = db.transaction(CSV_STORE, 'readonly');
+    const req = tx.objectStore(CSV_STORE).get(key);
+    req.onsuccess = () => resolve(req.result);
+    req.onerror = () => reject(req.error);
+  });
+}
+
+async function idbDel(key) {
+  const db = await openCsvDB();
+  return new Promise((resolve, reject) => {
+    const tx = db.transaction(CSV_STORE, 'readwrite');
+    tx.objectStore(CSV_STORE).delete(key);
+    tx.oncomplete = () => resolve();
+    tx.onerror = () => reject(tx.error);
+  });
+}
+
+function csvFingerprintFromFile(file) {
+  if (!file) return null;
+  return `${file.name}|${file.size}|${file.lastModified}`;
+}
+
+function formatDateTime(ts) {
+  try { return new Date(ts).toLocaleString('it-IT'); } catch (_) { return ''; }
+}
+
+function updateSavedCsvInfoUI(payload) {
+  const info = document.getElementById('savedCsvInfo');
+  if (!info) return;
+
+  if (!payload || !payload.listino?.length) {
+    info.textContent = 'Nessun CSV salvato.';
+    return;
   }
 
-  if(UI.btnShareWA && !UI.btnShareWA.__bound){
-    UI.btnShareWA.__bound = true;
-    UI.btnShareWA.addEventListener("click", () => {
-      const txt = buildClientReadyReport();
-      if(!txt) return;
-      shareViaWhatsApp(txt);
+  const name = payload.meta?.name ? `“${payload.meta.name}”` : 'CSV';
+  const when = payload.savedAt ? formatDateTime(payload.savedAt) : '';
+  const rows = payload.listino?.length || 0;
+
+  info.textContent = `Salvato: ${name} • Righe: ${rows}${when ? ' • ' + when : ''}`;
+}
+
+async function saveLastCsvPayload({ listinoRows, meta }) {
+  const remember = document.getElementById('toggleRememberCSV');
+  if (remember && !remember.checked) return;
+
+  const payload = { savedAt: Date.now(), meta: meta || {}, listino: listinoRows || [] };
+
+  try {
+    await idbSet(CSV_KEY, payload);
+    updateSavedCsvInfoUI(payload);
+  } catch (e) {
+    console.warn('Impossibile salvare CSV in IndexedDB:', e);
+  }
+}
+
+async function loadLastCsvPayload() {
+  try { return await idbGet(CSV_KEY); }
+  catch (e) { console.warn('Impossibile leggere CSV da IndexedDB:', e); return null; }
+}
+
+async function clearLastCsvPayload() {
+  try { await idbDel(CSV_KEY); }
+  catch (e) { console.warn('Impossibile cancellare CSV da IndexedDB:', e); }
+  updateSavedCsvInfoUI(null);
+}
+
+async function tryAutoLoadSavedCsvOnStart() {
+  const payload = await loadLastCsvPayload();
+  updateSavedCsvInfoUI(payload);
+
+  if (payload && Array.isArray(payload.listino) && payload.listino.length) {
+    listino = payload.listino;
+    const err = document.getElementById("csvError");
+    if (err) err.style.display = "none";
+    aggiornaListinoSelect();
+  }
+}
+
+function bindCsvMemoryUI() {
+  const btnLoad = document.getElementById('btnLoadSavedCSV');
+  const btnClear = document.getElementById('btnClearSavedCSV');
+
+  if (btnLoad) {
+    btnLoad.addEventListener('click', async () => {
+      const payload = await loadLastCsvPayload();
+      if (!payload || !payload.listino?.length) {
+        alert('Nessun CSV salvato trovato.');
+        return;
+      }
+      listino = payload.listino;
+      const err = document.getElementById("csvError");
+      if (err) err.style.display = "none";
+      aggiornaListinoSelect();
+      updateSavedCsvInfoUI(payload);
     });
   }
 
-  if(UI.btnExportTxt && !UI.btnExportTxt.__bound){
-    UI.btnExportTxt.__bound = true;
-    UI.btnExportTxt.addEventListener("click", () => {
-      const txt = buildClientReadyReport();
-      if(!txt) return;
-      downloadTxt(txt);
+  if (btnClear) {
+    btnClear.addEventListener('click', async () => {
+      await clearLastCsvPayload();
+      alert('CSV salvato cancellato.');
     });
   }
 
-  enableShareButtons(false);
+  loadLastCsvPayload().then(updateSavedCsvInfoUI).catch(() => {});
 }
 
-
-function show(el, yes){ if(el) el.style.display = yes ? "" : "none"; }
-
-async function loadJSON(path){
-  const r = await fetch(path, { cache: "no-store" });
-  if(!r.ok) throw new Error(`Impossibile caricare ${path}`);
-  return r.json();
-}
-
-function uniq(arr){ return [...new Set(arr)].sort((a,b)=>a.localeCompare(b)); }
-
-function fillSelect(select, items, {placeholder="— Seleziona —", valueKey=null, labelKey=null} = {}){
-  if(!select) return;
-  select.innerHTML = "";
-  const o0 = document.createElement("option");
-  o0.value = "";
-  o0.textContent = placeholder;
-  select.appendChild(o0);
-
-  for (const it of items){
-    const o = document.createElement("option");
-    if (typeof it === "string"){
-      o.value = it; o.textContent = it;
-    } else {
-      o.value = valueKey ? it[valueKey] : String(it);
-      o.textContent = labelKey ? it[labelKey] : String(it);
-    }
-    select.appendChild(o);
-  }
-}
-
-function round2(x){ return Math.round((x + Number.EPSILON) * 100) / 100; }
-
-function normalizeProvince(p){
-  const x = (p || "").trim().toUpperCase();
-  if(x === "SU") return "CI";
-  return x;
-}
-
-// ✅ NORMALIZZA REGIONE (per match con JSON in maiuscolo o nomi speciali)
-function normalizeRegion(r){
-  return (r || "")
-    .trim()
-    .toUpperCase()
-    .replace(/\s+/g, " ");
-}
-
-// ✅ NORMALIZZA CODICE ARTICOLO (MEC 820VDL == MEC820VDL)
-function normalizeCode(s){
-  return (s || "")
-    .toString()
-    .trim()
-    .toLowerCase()
-    .replace(/[^a-z0-9]/g, "");
-}
-
-// flags "touched" (non sovrascrivere se l’utente modifica a mano)
-function markTouched(el){
-  if(!el) return;
-  el.dataset.touched = "1";
-}
-function isTouched(el){
-  return !!(el && el.dataset.touched === "1");
-}
-function clearTouched(el){
-  if(!el) return;
-  delete el.dataset.touched;
-}
-
-function applyServiceUI(){
-  const s = UI.service.value;
-
-  show(UI.provinceField, s === "GROUPAGE");
-  show(UI.palletTypeField, s === "PALLET");
-  show(UI.lmField, s === "GROUPAGE");
-  show(UI.quintaliField, s === "GROUPAGE");
-  show(UI.palletCountField, s === "GROUPAGE");
-
-  if(UI.outAlerts) UI.outAlerts.innerHTML = "";
-  if(UI.outCost) UI.outCost.textContent = "—";
-  if(UI.btnCopy) UI.btnCopy.disabled = true;
-  enableShareButtons(false);
-}
-
-function searchArticles(q){
-  const t = (q || "").trim().toLowerCase();
-  if(!t) return DB.articles.slice(0, 200);
-
-  const tn = normalizeCode(t);
-
-  return DB.articles
-    .filter(a => {
-      const codeN = normalizeCode(a.code || "");
-      const name = (a.name||"").toLowerCase();
-      const brand = (a.brand||"").toLowerCase();
-      const tags = (a.tags||[]).join(" ").toLowerCase();
-      return (
-        codeN.includes(tn) ||
-        name.includes(t) ||
-        brand.includes(t) ||
-        tags.includes(t)
-      );
-    })
-    .slice(0, 200);
-}
-
-function renderArticleList(q){
-  const items = searchArticles(q).map(a => ({
-    id: a.id,
-    label: `${a.brand ? a.brand + " — " : ""}${a.name}${a.code ? " · " + a.code : ""}`
+function normalizeListino(rows) {
+  return rows.map(row => ({
+    codice: (row["Codice"] || "").trim(),
+    descrizione: (row["Descrizione"] || "").trim(),
+    prezzoLordo: parseDec(row["PrezzoLordo"] || "0"),
+    sconto: 0,
+    sconto2: 0,
+    margine: 0,
+    scontoCliente: 0, // NEW
+    costoTrasporto: parseDec(row["CostoTrasporto"] || "0"),
+    costoInstallazione: parseDec(row["CostoInstallazione"] || "0"),
+    quantita: 1,
+    venduto: 0
   }));
-  fillSelect(UI.article, items, { placeholder: "— Seleziona articolo —", valueKey:"id", labelKey:"label" });
 }
 
-function selectedArticle(){
-  const id = UI.article.value;
-  return DB.articles.find(a => a.id === id) || null;
+// --- SMART SETTINGS
+const SMART_KEY = 'csvxpresssmart_settings_v1';
+let smartSettings = {
+  smartMode: false,
+  showVAT: false,
+  vatRate: 22,
+  hideVenduto: true,
+  hideDiff: true,
+  hideDiscounts: true,
+  showClientDiscount: false // flag "Sconto Cliente"
+};
+
+function loadSmartSettings() {
+  try {
+    const raw = localStorage.getItem(SMART_KEY);
+    if (!raw) return;
+    const obj = JSON.parse(raw);
+    smartSettings = { ...smartSettings, ...obj };
+  } catch (_) {}
 }
 
-function addAlert(title, text){
-  if(!UI.outAlerts) return;
-  const div = document.createElement("div");
-  div.className = "alert";
-  div.innerHTML = `<b>${title}</b><div>${text}</div>`;
-  UI.outAlerts.appendChild(div);
+function saveSmartSettings() {
+  try { localStorage.setItem(SMART_KEY, JSON.stringify(smartSettings)); } catch (_) {}
 }
 
-/* -------------------- GROUPAGE: RISOLUZIONE PROVINCE "RAGGRUPPATE" -------------------- */
-/* Esempi chiavi Excel:
-   - "FR LT"
-   - "RI VT RM"
-   - "BN-NA"
-   - "AV-SA"
-   - "MT / PZ"
-*/
-function tokenizeProvinceGroupKey(key){
-  const raw = (key || "").toUpperCase();
-  // split su spazi, slash, trattini, virgole, punto e virgola
-  const tokens = raw.split(/[\s\/,\-;]+/g).map(t => t.trim()).filter(Boolean);
-  // tieni solo token "tipo provincia" (2 lettere)
-  return tokens.filter(t => /^[A-Z]{2}$/.test(t)).map(normalizeProvince);
+// -------------------- SCONTO CLIENTE (MODE SWITCH) --------------------
+function computeClientDiscountFromCurrent(articolo) {
+  const prezzoLordo = parseDec(articolo.prezzoLordo || 0);
+  if (prezzoLordo <= 0) return 0;
+
+  // prezzo "venduto al cliente" (senza servizi) = conMargineUnit
+  // uso __ignoreClientDiscount per leggere il valore reale anche se il flag è attivo
+  const r = computeRow({ ...articolo, __ignoreClientDiscount: true });
+  const target = parseDec(r.conMargineUnit || 0);
+
+  const eq = (1 - (target / prezzoLordo)) * 100;
+  return clamp(eq, 0, 100);
 }
 
-function resolveGroupageProvinceKey(province2){
-  const prov = normalizeProvince(province2);
-  const provinces = DB.groupageRates?.provinces || {};
+function applyClientDiscountMode(enabled) {
+  articoliAggiunti = articoliAggiunti.map(a => {
+    const item = { ...a };
 
-  // 1) match diretto
-  if(provinces[prov]) return { key: prov, data: provinces[prov], matchedBy: "direct" };
+    if (enabled) {
+      // backup dei valori originali (una sola volta)
+      if (item._bakSconto === undefined) item._bakSconto = parseDec(item.sconto || 0);
+      if (item._bakSconto2 === undefined) item._bakSconto2 = parseDec(item.sconto2 || 0);
+      if (item._bakMargine === undefined) item._bakMargine = parseDec(item.margine || 0);
 
-  // 2) match dentro chiavi raggruppate
-  for(const k of Object.keys(provinces)){
-    const toks = tokenizeProvinceGroupKey(k);
-    if(toks.includes(prov)){
-      return { key: k, data: provinces[k], matchedBy: "group" };
-    }
-  }
+      // calcola sconto cliente equivalente per mantenere invariato il prezzo finale
+      item.scontoCliente = computeClientDiscountFromCurrent(item);
 
-  return null;
-}
+      // azzera i campi "interni" (restano in backup)
+      item.sconto = 0;
+      item.sconto2 = 0;
+      item.margine = 0;
 
-
-/* -------------------- NOTE RULES (override servizio/opzioni) -------------------- */
-/*
-  Regole richieste:
-  - "NO SPONDA" da solo: NON forza groupage; disabilita solo la spunta Sponda.
-  - Se la nota contiene "GROUPAGE": forza servizio GROUPAGE.
-  - Se la nota contiene "X MT" (es. 3 MT): forza LM a X (solo se GROUPAGE forzato o se sei già in GROUPAGE).
-  - Se la nota contiene "quotazione" / "preventivo": segnala come "quotazione" (forceQuote).
-*/
-
-function getArticleNoteText(art){
-  if(!art) return "";
-  // supporta vari nomi di campo
-  const n =
-    art.note ?? art.notes ?? art.nota ?? art.Note ?? art.Notes ?? "";
-  return String(n || "").trim();
-}
-
-function parseNoteDirectives(noteText){
-  const t = String(noteText || "").toUpperCase();
-
-  const hasGroupage = t.includes("GROUPAGE");
-  const hasNoSponda = t.includes("NO SPONDA");
-  const hasOkSponda = t.includes("OK SPONDA"); // se presente, non blocchiamo la sponda
-
-  // Cerca "3 MT" / "3,5 MT"
-  let forceLm = null;
-  const m = t.match(/(\d+(?:[.,]\d+)?)\s*MT\b/);
-  if(m){
-    forceLm = Number(String(m[1]).replace(",", "."));
-    if(!Number.isFinite(forceLm)) forceLm = null;
-  }
-
-  const forceQuote = /QUOTAZIONE|PREVENTIVO/i.test(noteText || "");
-
-  return {
-    forceService: hasGroupage ? "GROUPAGE" : null,
-    forceLm,
-    forbidSponda: hasNoSponda && !hasOkSponda, // NO SPONDA blocca sponda (anche se non groupage)
-    forceQuote
-  };
-}
-
-function applyNoteOverridesToUI(art){
-  const note = getArticleNoteText(art);
-  const dir = parseNoteDirectives(note);
-
-  // 1) Sponda
-  if(UI.optSponda){
-    if(dir.forbidSponda){
-      UI.optSponda.checked = false;
-      UI.optSponda.disabled = true;
     } else {
-      UI.optSponda.disabled = false;
+      // ripristina i valori originali
+      if (item._bakSconto !== undefined) item.sconto = item._bakSconto;
+      if (item._bakSconto2 !== undefined) item.sconto2 = item._bakSconto2;
+      if (item._bakMargine !== undefined) item.margine = item._bakMargine;
+      // lascio item.scontoCliente come memoria
     }
-  }
 
-  // 2) Servizio
-  if(dir.forceService && UI.service && UI.service.value !== dir.forceService){
-    UI.service.value = dir.forceService;
-    applyServiceUI();
-  }
+    return item;
+  });
 
-  // 3) Metri lineari (solo se in GROUPAGE)
-  if(dir.forceLm != null && UI.service?.value === "GROUPAGE" && UI.lm){
-    // anche se "touched", qui è una regola di listino: sovrascriviamo
-    UI.lm.value = String(dir.forceLm);
-    // non marchiamo touched: è un valore imposto dalla regola
-    clearTouched(UI.lm);
-  }
-
-  // 4) forceQuote: la gestiamo nel calcolo (out.alerts). Qui nulla.
-  return dir;
+  renderTabellaArticoli();
+  aggiornaTotaliGenerali();
+  updateEquivalentDiscountDisplay();
 }
 
-function applyNoteOverridesToCalc({service, lm, opts, art}){
-  const note = getArticleNoteText(art);
-  const dir = parseNoteDirectives(note);
+// -------------------- SCONTO EQUIVALENTE CLIENTE (UI) --------------------
+function updateEquivalentDiscountDisplay() {
+  const el = document.getElementById('smartEquivalentDiscount');
+  if (!el) return;
 
-  // Sponda
-  if(dir.forbidSponda){
-    opts.sponda = false;
+  let base = 0;
+  let final = 0;
+
+  articoliAggiunti.forEach(a => {
+    const qta = a.quantita || 1;
+    const prezzoLordo = a.prezzoLordo || 0;
+    const r = computeRow(a);
+    base += (prezzoLordo * qta);
+    final += (r.conMargineUnit * qta);
+  });
+
+  base = roundTwo(base);
+  final = roundTwo(final);
+
+  if (!base || base <= 0) {
+    el.textContent = '—';
+    return;
   }
 
-  // Servizio forzato
-  if(dir.forceService){
-    service = dir.forceService;
-  }
+  let eq = (1 - (final / base)) * 100;
+  eq = clamp(eq, -9999, 9999);
 
-  // LM forzati solo se groupage (forzato o selezionato)
-  if(dir.forceLm != null && service === "GROUPAGE"){
-    lm = dir.forceLm;
-  }
-
-  return { service, lm, opts, dir };
+  el.textContent = `${eq.toFixed(2)}%`;
 }
 
-/* -------------------- AUTO-FILL DA ARTICOLO -------------------- */
+// -------------------- INIT --------------------
+document.addEventListener("DOMContentLoaded", function () {
+  loadSmartSettings();
 
-function onArticleChange(){
-  const art = selectedArticle();
-  if(!art) return;
-
-
-  // NOTE rules: forza servizio/opzioni secondo listino (NO SPONDA / GROUPAGE X MT / quotazione)
-  const __noteDir = applyNoteOverridesToUI(art);
-  // se "quotazione" in nota, aggiungiamo una reason leggibile (non client-facing)
-  if(__noteDir && __noteDir.forceQuote){
-    art.rules = art.rules || {};
-    art.rules.forceQuote = true;
-    art.rules.forceQuoteReason = art.rules.forceQuoteReason || "Nota articolo: quotazione/preventivo.";
+  // Micro-fix layout tabella (stabilizza allineamento colonne anche senza toccare style.css)
+  const table = document.getElementById('articoli-table');
+  if (table) {
+    table.style.width = '100%';
+    table.style.tableLayout = 'fixed';
+    table.style.borderCollapse = 'collapse';
   }
 
-  // ✅ se l’articolo ha pack.palletType, compila automaticamente PALLET TYPE
-  const pt = (art.pack?.palletType || "").trim();
-  if(pt && UI.palletType){
-    if(!isTouched(UI.palletType)){
-      UI.palletType.value = pt;
-    }
-  }
+  bindCsvMemoryUI();
+  tryAutoLoadSavedCsvOnStart();
 
-  // ✅ AUTO-FILL GROUPAGE da rules (es. groupageLm)
-  const r = art.rules || {};
-  if(UI.service?.value === "GROUPAGE"){
-    if(r.groupageLm != null && UI.lm && !isTouched(UI.lm)){
-      UI.lm.value = String(r.groupageLm);
-    }
-    // se in futuro aggiungi: groupageQuintali / groupagePalletCount
-    if(r.groupageQuintali != null && UI.quintali && !isTouched(UI.quintali)){
-      UI.quintali.value = String(r.groupageQuintali);
-    }
-    if(r.groupagePalletCount != null && UI.palletCount && !isTouched(UI.palletCount)){
-      UI.palletCount.value = String(r.groupagePalletCount);
-    }
-  }
+  document.getElementById("csvFileInput").addEventListener("change", handleCSVUpload);
+  document.getElementById("searchListino").addEventListener("input", aggiornaListinoSelect);
 
-  // ✅ forza servizio PALLET se stai su GLS o se service è vuoto
-  if(UI.service){
-    if(!UI.service.value || UI.service.value === "GLS"){
-      UI.service.value = "PALLET";
-      applyServiceUI();
+  // Checkboxes (già presenti)
+  const checkbox1 = document.createElement("label");
+  checkbox1.innerHTML = `
+    <input type="checkbox" id="toggleCosti" checked onchange="togglePopolaCosti()"> Popola automaticamente Trasporto e Installazione
+  `;
+  document.getElementById("upload-section").appendChild(checkbox1);
+
+  const checkbox2 = document.createElement("label");
+  checkbox2.innerHTML = `
+    <br><input type="checkbox" id="toggleMostraServizi" checked> Mostra dettagli Trasporto/Installazione nel report
+  `;
+  document.getElementById("upload-section").appendChild(checkbox2);
+
+  // Bottone manuale
+  const manualButton = document.createElement("button");
+  manualButton.textContent = "Aggiungi Articolo Manualmente";
+  manualButton.onclick = mostraFormArticoloManuale;
+  document.getElementById("listino-section").appendChild(manualButton);
+
+  bindSmartControls();
+
+  // Se l'utente aveva già attivo il flag, applicalo alla tabella caricata
+  if (smartSettings.showClientDiscount) applyClientDiscountMode(true);
+
+  // Prima render
+  renderTabellaArticoli();          // crea righe e input una sola volta
+  aggiornaTotaliGenerali();
+  applyColumnVisibility();
+  updateEquivalentDiscountDisplay();
+});
+
+// -------------------- SMART CONTROLS --------------------
+function bindSmartControls() {
+  const elSmart = document.getElementById('toggleSmartMode');
+  const elVat = document.getElementById('toggleShowVAT');
+  const elVatRate = document.getElementById('vatRate');
+  const elHideVenduto = document.getElementById('toggleHideVenduto');
+  const elHideDiff = document.getElementById('toggleHideDiff');
+  const elHideDiscounts = document.getElementById('toggleHideDiscounts');
+  const elShowClientDiscount = document.getElementById('toggleShowClientDiscount');
+
+  if (elSmart) elSmart.checked = !!smartSettings.smartMode;
+  if (elVat) elVat.checked = !!smartSettings.showVAT;
+  if (elVatRate) elVatRate.value = smartSettings.vatRate ?? 22;
+  if (elHideVenduto) elHideVenduto.checked = !!smartSettings.hideVenduto;
+  if (elHideDiff) elHideDiff.checked = !!smartSettings.hideDiff;
+  if (elHideDiscounts) elHideDiscounts.checked = !!smartSettings.hideDiscounts;
+  if (elShowClientDiscount) elShowClientDiscount.checked = !!smartSettings.showClientDiscount;
+
+  const onChange = () => {
+    const prevClient = !!smartSettings.showClientDiscount;
+
+    smartSettings.smartMode = !!elSmart?.checked;
+    smartSettings.showVAT = !!elVat?.checked;
+
+    const rate = parseDec(elVatRate?.value || '22');
+    smartSettings.vatRate = clamp(rate, 0, 100);
+
+    smartSettings.hideVenduto = !!elHideVenduto?.checked;
+    smartSettings.hideDiff = !!elHideDiff?.checked;
+    smartSettings.hideDiscounts = !!elHideDiscounts?.checked;
+    smartSettings.showClientDiscount = !!elShowClientDiscount?.checked;
+
+    // Se smart attivo: forza alcune scelte
+    if (smartSettings.smartMode) {
+      smartSettings.hideVenduto = true;
+      smartSettings.hideDiff = true;
+      smartSettings.hideDiscounts = true;
     }
-  }
+
+    saveSmartSettings();
+    window.track?.smart_toggle?.({ key: 'settings', val: JSON.stringify(smartSettings) });
+
+    // Se cambia la modalità sconto cliente -> switch completo (mantiene invariato prezzo finale)
+    if (prevClient !== !!smartSettings.showClientDiscount) {
+      applyClientDiscountMode(!!smartSettings.showClientDiscount);
+      return; // applyClientDiscountMode già fa render + totali
+    }
+
+    applyColumnVisibility();
+    aggiornaCalcoliRighe();   // aggiorna SOLO celle numeriche, senza ricreare input
+    aggiornaTotaliGenerali();
+    updateEquivalentDiscountDisplay();
+  };
+
+  [elSmart, elVat, elVatRate, elHideVenduto, elHideDiff, elHideDiscounts, elShowClientDiscount]
+    .filter(Boolean)
+    .forEach(el => el.addEventListener('change', onChange));
 }
 
-/* -------------------- CALCOLO -------------------- */
+function applyColumnVisibility() {
+  const hideVenduto = smartSettings.smartMode ? true : smartSettings.hideVenduto;
+  const hideDiff = smartSettings.smartMode ? true : smartSettings.hideDiff;
 
-function applyKmAndDisagiata({base, shipments=1, opts, rules, alerts, mode="GROUPAGE"}){
-  const kmThreshold = DB.groupageRates?.meta?.km_threshold ?? 30;
-  const kmSurcharge = DB.groupageRates?.meta?.km_surcharge_per_km ?? 0;
-  const disFee = DB.groupageRates?.meta?.disagiata_surcharge ?? 0;
+  setColHidden('venduto', hideVenduto);
+  setColHidden('diff', hideDiff);
 
-  const kmOver = Math.max(0, parseInt(opts?.kmOver || 0, 10) || 0);
+  const clientMode = !!smartSettings.showClientDiscount;
 
-  if(kmOver > 0){
-    alerts.push(`Distanza extra indicata: +${kmOver} km (oltre ${kmThreshold} km). Verificare condizioni.`);
-    if(kmSurcharge > 0){
-      base += (kmOver * kmSurcharge) * (mode === "PALLET" ? shipments : 1);
-      rules.push(`km+${kmOver}`);
-    }
-  }
+  // modalità sconto cliente: sostituisce input in tabella
+  setColHidden('sconto1', clientMode);
+  setColHidden('sconto2', clientMode);
+  setColHidden('margine', smartSettings.smartMode || clientMode);
+  setColHidden('scontoCliente', !clientMode);
 
-  if(opts?.disagiata){
-    alerts.push("Località disagiata: possibile extra / preventivo (flag).");
-    if(disFee > 0){
-      base += disFee * (mode === "PALLET" ? shipments : 1);
-      rules.push("disagiata");
-    }
-  }
-
-  return base;
+  // smart: nascondo prezzo lordo (interno)
+  setColHidden('prezzoLordo', smartSettings.smartMode);
 }
 
-function computePallet({region, palletType, qty, opts, art}){
-  const rules = [];
-  const alerts = [];
-
-  if(!region) return { cost:null, rules:["Manca regione"], alerts:["Seleziona una regione."] };
-  if(!palletType) return { cost:null, rules:["Manca taglia bancale"], alerts:["Seleziona tipo bancale (QUARTER/HALF/MEDIUM/...)."] };
-
-  const rate = DB.palletRates?.rates?.[region]?.[palletType];
-  if(rate == null){
-    return { cost:null, rules:["Tariffa non trovata"], alerts:[`Nessuna tariffa bancale per ${region} / ${palletType}.`] };
-  }
-
-  const maxPerShipment = DB.palletRates?.meta?.maxPalletsPerShipment ?? 5;
-  const shipments = Math.ceil(qty / maxPerShipment);
-  if(shipments > 1){
-    rules.push(`split:${shipments}`);
-    alerts.push(`Quantità > ${maxPerShipment}: divisione in ${shipments} spedizioni (stima).`);
-  }
-
-  let base = rate * qty;
-
-  if(opts.preavviso && DB.palletRates?.meta?.preavviso_fee != null){
-    base += DB.palletRates.meta.preavviso_fee * shipments;
-    rules.push("preavviso");
-  }
-  if(opts.assicurazione && DB.palletRates?.meta?.insurance_pct != null){
-    base = base * (1 + DB.palletRates.meta.insurance_pct);
-    rules.push("assicurazione");
-  }
-
-  base = applyKmAndDisagiata({ base, shipments, opts, rules, alerts, mode:"PALLET" });
-
-  // ✅ se l’articolo richiede preventivo, lo segnaliamo ma NON blocchiamo il calcolo
-  if(art?.rules?.forceQuote){
-    rules.push("forceQuote");
-    alerts.push(art.rules.forceQuoteReason || "Nota: quotazione/preventivo.");
-  }
-
-  return { cost: round2(base), rules, alerts };
+function setColHidden(colKey, hidden) {
+  document.querySelectorAll(`th[data-col="${colKey}"]`).forEach(th => th.classList.toggle('col-hidden', !!hidden));
+  document.querySelectorAll(`td[data-col="${colKey}"]`).forEach(td => td.classList.toggle('col-hidden', !!hidden));
 }
 
-function matchGroupageBracket(value, brackets){
-  // Returns { bracket, overflow }
-  // overflow=true when value exceeds the last defined max (we still return the last bracket)
-  if(!Array.isArray(brackets) || brackets.length===0) return { bracket:null, overflow:false };
+// -------------------- POPOLA COSTI --------------------
+function togglePopolaCosti() {
+  autoPopolaCosti = document.getElementById("toggleCosti").checked;
+  const secondCheckbox = document.getElementById("toggleMostraServizi");
+  secondCheckbox.disabled = !autoPopolaCosti;
+  mostraDettagliServizi = secondCheckbox.checked;
 
-  // normalize
-  const bs = brackets.slice().sort((a,b)=>(a.min??0)-(b.min??0));
-
-  for(const b of bs){
-    const okMin = value >= (b.min ?? 0);
-    const okMax = (b.max == null) ? true : value <= b.max;
-    if(okMin && okMax) return { bracket:b, overflow:false };
-  }
-
-  // If no bracket matched, value is likely above the highest max.
-  // Use the last bracket as a "cap" and signal overflow to the caller.
-  return { bracket: bs[bs.length-1], overflow:true };
-}
-
-function computeGroupage({province, lm, quintali, palletCount, opts, art}){
-  const rules = [];
-  const alerts = [];
-
-  if(!province) return { cost:null, rules:["Manca provincia"], alerts:["Seleziona una provincia."] };
-
-  const resolved = resolveGroupageProvinceKey(province);
-  if(!resolved){
-    return { cost:null, rules:["Provincia non trovata"], alerts:[`Nessuna tariffa groupage per ${province}.`] };
-  }
-
-  const p = resolved.data;
-  if(resolved.matchedBy === "group"){
-    rules.push(`provGroup:${resolved.key}`);
-    alerts.push(`Provincia ${province} tariffata come gruppo: ${resolved.key}`);
-  }
-
-  const candidates = [];
-  let overflow = false;
-
-  if(lm > 0 && Array.isArray(p.linearMeters)){
-    const r = matchGroupageBracket(lm, p.linearMeters);
-    if(r.bracket && r.bracket.price != null){
-      candidates.push({ mode:"lm", price: r.bracket.price, overflow: r.overflow });
-      if(r.overflow) overflow = true;
-    }
-  }
-  if(quintali > 0 && Array.isArray(p.quintali)){
-    const r = matchGroupageBracket(quintali, p.quintali);
-    if(r.bracket && r.bracket.price != null){
-      candidates.push({ mode:"quintali", price: r.bracket.price, overflow: r.overflow });
-      if(r.overflow) overflow = true;
-    }
-  }
-  if(palletCount > 0 && Array.isArray(p.pallets)){
-    const r = matchGroupageBracket(palletCount, p.pallets);
-    if(r.bracket && r.bracket.price != null){
-      candidates.push({ mode:"pallets", price: r.bracket.price, overflow: r.overflow });
-      if(r.overflow) overflow = true;
-    }
-  }
-
-  if(overflow){
-    // almeno uno dei parametri supera l'ultima fascia del listino.
-    // Manteniamo una stima usando l'ultima fascia disponibile, ma segnaliamo che serve preventivo.
-    alerts.push("Valori oltre fascia listino: stima calcolata a cap (consigliato preventivo).");
-    rules.push("overflow");
-  }
-
-  if(candidates.length === 0){
+  articoliAggiunti = articoliAggiunti.map(articolo => {
+    const listinoOriginale = listino.find(item => item.codice === articolo.codice);
     return {
-      cost:null,
-      rules:["Nessun parametro groupage valido"],
-      alerts:["Inserisci almeno uno tra Metri lineari / Quintali / N° bancali con valori coerenti alle fasce."]
+      ...articolo,
+      costoTrasporto: autoPopolaCosti && listinoOriginale ? listinoOriginale.costoTrasporto : 0,
+      costoInstallazione: autoPopolaCosti && listinoOriginale ? listinoOriginale.costoInstallazione : 0
     };
-  }
-
-  // Selezione tariffa: per groupage normalmente si applica il vincolo PIÙ penalizzante
-  // (LM / quintali / bancali). Default: MAX. Puoi forzare MIN via groupage_rates.json -> meta.selection_mode="min".
-  const selectionMode = (DB.groupageRates?.meta?.selection_mode || "max").toLowerCase();
-
-  let picked;
-  if(selectionMode === "min"){
-    picked = candidates.reduce((best, cur) => (best==null || cur.price < best.price) ? cur : best, null);
-    rules.push(`pick:min:${picked.mode}`);
-  } else {
-    picked = candidates.reduce((worst, cur) => (worst==null || cur.price > worst.price) ? cur : worst, null);
-    rules.push(`pick:max:${picked.mode}`);
-  }
-
-  let base = picked.price;
-
-  if(opts.sponda && DB.groupageRates?.meta?.liftgate_fee != null){
-    base += DB.groupageRates.meta.liftgate_fee;
-    rules.push("sponda");
-  }
-  if(opts.preavviso && DB.groupageRates?.meta?.preavviso_fee != null){
-    base += DB.groupageRates.meta.preavviso_fee;
-    rules.push("preavviso");
-  }
-  if(opts.assicurazione && DB.groupageRates?.meta?.insurance_pct != null){
-    base = base * (1 + DB.groupageRates.meta.insurance_pct);
-    rules.push("assicurazione");
-  }
-
-  base = applyKmAndDisagiata({ base, shipments:1, opts, rules, alerts, mode:"GROUPAGE" });
-
-  // ✅ se l’articolo richiede preventivo, lo segnaliamo ma NON blocchiamo il calcolo
-  if(art?.rules?.forceQuote){
-    rules.push("forceQuote");
-    alerts.push(art.rules.forceQuoteReason || "Nota: quotazione/preventivo.");
-  }
-
-  return { cost: round2(base), rules, alerts };
-}
-
-// ✅ GLS: non c’è tariffario nel tuo Excel 2026 -> blocchiamo
-function computeGLS(){
-  return {
-    cost: null,
-    rules: ["GLS disabilitato"],
-    alerts: ["Nel file Excel 2026 non esiste un tariffario GLS: calcolo non disponibile."]
-  };
-}
-
-function buildSummary({service, region, province, art, qty, palletType, lm, quintali, palletCount, opts, cost, rules, alerts, extraNote, cartInfo}){
-  const lines = [];
-  lines.push(`SERVIZIO: ${service}`);
-  lines.push(`DESTINAZIONE: ${province ? (province + " / ") : ""}${region || "—"}`);
-
-  // Se è attivo il carico groupage multi-articolo, riepilogo dettagliato
-  if(service === "GROUPAGE" && cartInfo && Array.isArray(cartInfo.items) && cartInfo.items.length){
-    lines.push(`CARICO: ${cartInfo.items.length} articoli`);
-    for(const it of cartInfo.items){
-      lines.push(`- ${it.label} x${it.qty}${it.isBase ? " [BASE]" : ""}${it.stackable ? " [stack]" : ""}`);
-    }
-  } else {
-    lines.push(`ARTICOLO: ${art ? `${art.brand || ""} ${art.name} (${art.code || art.id})`.trim() : "—"}`);
-    lines.push(`QTA: ${qty}`);
-  }
-
-  if(service === "PALLET") lines.push(`Bancale: ${palletType || "—"}`);
-  if(service === "GROUPAGE") lines.push(`Groupage: LM=${lm} | q.li=${quintali} | plt=${palletCount}`);
-
-  const optList = [];
-  if(opts.preavviso) optList.push("preavviso");
-  if(opts.assicurazione) optList.push("assicurazione");
-  if(opts.sponda) optList.push("sponda");
-  if(opts.disagiata) optList.push("disagiata");
-  if((opts.kmOver||0) > 0) optList.push(`km+${opts.kmOver}`);
-  lines.push(`OPZIONI: ${optList.length ? optList.join(", ") : "nessuna"}`);
-
-  if(extraNote?.trim()) lines.push(`NOTE EXTRA: ${extraNote.trim()}`);
-
-  lines.push("");
-    lines.push(`COSTO PREVENTIVATO: ${moneyEUR(Number.isFinite(cost) ? round2(cost * 1.3) : null)}`);
-  if(rules?.length) lines.push(`REGOLE: ${rules.join(" | ")}`);
-
-  if(alerts?.length){
-    lines.push("");
-    lines.push("ATTENZIONE:");
-    for(const a of alerts) lines.push(`- ${a}`);
-  }
-
-  return lines.join("\n");
-}
-
-/* -------------------- BATCH OFFERTA (fix match code) -------------------- */
-
-function findArticleByCode(code){
-  const t = normalizeCode(code);
-  if(!t) return null;
-  return DB.articles.find(a => normalizeCode(a.code || "") === t) || null;
-}
-
-/* -------------------- UI ACTIONS -------------------- */
-
-function onCalc(){
-  const service = UI.service.value;
-
-  const region = normalizeRegion(UI.region.value);
-  const province = normalizeProvince(UI.province.value);
-
-  const qty = Math.max(1, parseInt(UI.qty.value || "1", 10));
-  const palletType = (UI.palletType.value || "").trim();
-
-  let lm = parseFloat(UI.lm.value || "0");
-  let quintali = parseFloat(UI.quintali.value || "0");
-  let palletCount = parseFloat(UI.palletCount.value || "0");
-
-  // ✅ GROUPAGE multi-carico: se ho articoli nel carico, calcolo LM/q.li/bancali dal carico
-  let cartInfo = null;
-  if(UI.service.value === "GROUPAGE" && GROUPAGE_CART.length){
-    const t = calcGroupageCartTotals();
-    // Forziamo i campi in modo trasparente (utile anche per copia/incolla screenshot)
-    if(UI.lm && !isTouched(UI.lm)) UI.lm.value = String(t.lmBill || 0);
-    if(UI.quintali && !isTouched(UI.quintali)) UI.quintali.value = String(t.quintaliTotal || 0);
-    if(UI.palletCount && !isTouched(UI.palletCount)) UI.palletCount.value = String(t.palletsTotal || 0);
-
-    lm = Number(t.lmBill || 0);
-    quintali = Number(t.quintaliTotal || 0);
-    palletCount = Number(t.palletsTotal || 0);
-
-    cartInfo = {
-      lmUsed: t.lmUsed,
-      lmBill: t.lmBill,
-      quintaliTotal: t.quintaliTotal,
-      palletsTotal: t.palletsTotal,
-      baseId: GROUPAGE_BASE_ID || GROUPAGE_CART[0].artId,
-      items: GROUPAGE_CART.map(it => {
-        const a = getArtById(it.artId);
-        return {
-          id: it.artId,
-          qty: it.qty,
-          stackable: !!it.stackable,
-          isBase: it.artId === (GROUPAGE_BASE_ID || GROUPAGE_CART[0].artId),
-          label: a ? `${a.brand ? a.brand + " — " : ""}${a.name}${a.code ? " · " + a.code : ""}` : it.artId
-        };
-      })
-    };
-  }
-
-  const opts = {
-    preavviso: !!UI.optPreavviso.checked,
-    assicurazione: !!UI.optAssicurazione.checked,
-    sponda: !!UI.optSponda.checked,
-    disagiata: !!UI.optDisagiata?.checked,
-    kmOver: parseInt(UI.kmOver?.value || "0", 10) || 0
-  };
-
-  const art = selectedArticle();
-
-  // NOTE rules: applica override di listino al calcolo (NO SPONDA non forza groupage; GROUPAGE forza servizio + LM se indicati)
-  let __svc = service;
-  let __lm = lm;
-  let __opts = opts;
-  let __dir = null;
-
-  if(art){
-    const adj = applyNoteOverridesToCalc({ service: __svc, lm: __lm, opts: __opts, art });
-    __svc = adj.service;
-    __lm = adj.lm;
-    __opts = adj.opts;
-    __dir = adj.dir;
-
-    if(__dir && __dir.forceQuote){
-      art.rules = art.rules || {};
-      art.rules.forceQuote = true;
-      art.rules.forceQuoteReason = art.rules.forceQuoteReason || "Nota articolo: quotazione/preventivo.";
-    }
-
-    // Se il servizio viene forzato, aggiorna anche la UI per coerenza
-    if(UI.service && UI.service.value !== __svc){
-      UI.service.value = __svc;
-      applyServiceUI();
-    }
-
-    // Se LM viene forzato in groupage, aggiorna anche i campi UI (non "touched")
-    if(__svc === "GROUPAGE" && __dir && __dir.forceLm != null && UI.lm){
-      UI.lm.value = String(__lm);
-      clearTouched(UI.lm);
-    }
-
-    // Sponda vietata => aggiorna UI
-    if(__dir && __dir.forbidSponda && UI.optSponda){
-      UI.optSponda.checked = false;
-      UI.optSponda.disabled = true;
-    }
-  }
-
-  UI.dbgArticle.textContent = art ? JSON.stringify({id:art.id, code:art.code, pack:art.pack || {}, rules: art.rules || {}}, null, 0) : "—";
-
-  let out;
-  if(__svc === "PALLET"){
-    out = computePallet({ region, palletType, qty, opts: __opts, art });
-  } else if(__svc === "GROUPAGE"){
-    out = computeGroupage({ province, lm: __lm, quintali, palletCount, opts: __opts, art: (cartInfo?.baseId ? getArtById(cartInfo.baseId) : art) });
-  } else {
-    out = computeGLS();
-  }
-
-  UI.outAlerts.innerHTML = "";
-  (out.alerts || []).forEach(a => addAlert("Nota / Controllo", a));
-
-  const summary = buildSummary({
-    service: __svc,
-    region,
-    province,
-    art,
-    qty,
-    palletType,
-    lm: __lm, quintali, palletCount,
-    opts: __opts,
-    cost: out.cost,
-    rules: out.rules || [],
-    alerts: out.alerts || [],
-    extraNote: UI.extraNote.value || "",
-    cartInfo
   });
 
-  UI.outText.textContent = summary;
-    // Mostra solo il costo preventivato (costo × 1,3)
-  UI.outCost.textContent = Number.isFinite(out.cost) ? moneyEUR(round2(out.cost * 1.3)) : "—";
-// Abilita share solo se esiste un report client-ready valido
-  enableShareButtons(!!buildClientReadyReport());
-
-  UI.dbgRules.textContent = (out.rules || []).join(", ") || "—";
-
-  UI.btnCopy.disabled = !summary;
-  UI.btnCopy.dataset.copy = summary;
+  renderTabellaArticoli();
+  aggiornaTotaliGenerali();
+  updateEquivalentDiscountDisplay();
 }
 
-async function onCopy(){
-  const text = UI.btnCopy.dataset.copy || "";
-  if(!text) return;
+// -------------------- CSV UPLOAD --------------------
+function handleCSVUpload(event) {
+  const file = event.target.files[0];
+  if (!file) return;
+
+  window.track?.csv_upload_start?.({ method: 'file_input' });
+  window.track?.csv_upload_ok?.({ method: 'file_input', file });
+
+  const t0 = performance.now();
+
+  Papa.parse(file, {
+    header: true,
+    skipEmptyLines: true,
+    complete: function(results) {
+      const ms = Math.round(performance.now() - t0);
+
+      if (!results.data.length) {
+        document.getElementById("csvError").style.display = "block";
+        window.track?.csv_parse_error?.({ code: 'empty_or_no_rows', ms });
+        return;
+      }
+
+      listino = normalizeListino(results.data);
+
+      saveLastCsvPayload({
+        listinoRows: listino,
+        meta: { name: file.name, size: file.size, lastModified: file.lastModified, fp: csvFingerprintFromFile(file) }
+      });
+
+      const rows = listino.length;
+      const cols = Array.isArray(results.meta?.fields) ? results.meta.fields.length : undefined;
+      window.track?.csv_parse_ok?.({ rows, cols, ms });
+
+      document.getElementById("csvError").style.display = "none";
+      aggiornaListinoSelect();
+    },
+    error: function(err) {
+      const ms = Math.round(performance.now() - t0);
+      console.error("Errore CSV:", err);
+      document.getElementById("csvError").style.display = "block";
+      window.track?.csv_parse_error?.({ code: 'papaparse_error', ms });
+    }
+  });
+}
+
+function aggiornaListinoSelect() {
+  const select = document.getElementById("listinoSelect");
+  const searchTerm = document.getElementById("searchListino").value.toLowerCase();
+  select.innerHTML = "";
+
+  listino.forEach((item) => {
+    if (item.codice.toLowerCase().includes(searchTerm) || item.descrizione.toLowerCase().includes(searchTerm)) {
+      const option = document.createElement("option");
+      option.value = item.codice;
+      option.textContent = `${item.codice} - ${item.descrizione} - €${roundTwo(item.prezzoLordo).toFixed(2)}`;
+      select.appendChild(option);
+    }
+  });
+}
+
+function aggiungiArticoloDaListino() {
+  window.track?.add_item_listino?.();
+
+  const select = document.getElementById("listinoSelect");
+  if (!select.value) return;
+
+  const articolo = listino.find(item => item.codice === select.value);
+  if (!articolo) {
+    alert("Errore: articolo non trovato nel listino.");
+    return;
+  }
+
+  const nuovoArticolo = { ...articolo };
+  if (!autoPopolaCosti) {
+    nuovoArticolo.costoTrasporto = 0;
+    nuovoArticolo.costoInstallazione = 0;
+  }
+
+  // se modalità sconto cliente è attiva, inizializza con sconto cliente equivalente
+  if (smartSettings.showClientDiscount) {
+    nuovoArticolo.scontoCliente = computeClientDiscountFromCurrent(nuovoArticolo);
+  }
+
+  articoliAggiunti.push(nuovoArticolo);
+  renderTabellaArticoli();
+  aggiornaTotaliGenerali();
+  updateEquivalentDiscountDisplay();
+}
+
+// -------------------- CALCOLI RIGA --------------------
+function computeRow(articolo) {
+  const prezzoLordo = parseDec(articolo.prezzoLordo || 0);
+  const qta = Math.max(1, parseInt(articolo.quantita || 1, 10) || 1);
+
+  // modalità "Sconto Cliente" attiva (salvo override interno)
+  const useClientDiscount = !!smartSettings.showClientDiscount && !articolo.__ignoreClientDiscount;
+
+  let sconto1 = 0;
+  let sconto2 = 0;
+  let margine = 0;
+
+  let totaleNettoUnit = 0;   // valore mostrato come "Prezzo netto" (tabella/report)
+  let conMargineUnit = 0;    // prezzo venduto al cliente (senza servizi)
+
+  if (useClientDiscount) {
+    const scontoCliente = clamp(parseDec(articolo.scontoCliente || 0), 0, 100);
+    conMargineUnit = roundTwo(prezzoLordo * (1 - scontoCliente / 100));
+    totaleNettoUnit = conMargineUnit;
+
+  } else {
+    sconto1 = clamp(parseDec(articolo.sconto || 0), 0, 100);
+    sconto2 = clamp(parseDec(articolo.sconto2 || 0), 0, 100);
+
+    const prezzoScontato = prezzoLordo * (1 - sconto1 / 100) * (1 - sconto2 / 100);
+    totaleNettoUnit = roundTwo(prezzoScontato);
+
+    margine = clamp(parseDec(articolo.margine || 0), 0, 99.99);
+    conMargineUnit = roundTwo(totaleNettoUnit / (1 - margine / 100));
+  }
+
+  const serviziUnit = roundTwo(parseDec(articolo.costoTrasporto || 0) + parseDec(articolo.costoInstallazione || 0));
+  const granTotRiga = roundTwo((conMargineUnit + serviziUnit) * qta);
+
+  const venduto = parseDec(articolo.venduto || 0);
+  const differenza = roundTwo(venduto - granTotRiga);
+
+  const nettoCadSmart = roundTwo(granTotRiga / qta);
+
+  return { sconto1, sconto2, totaleNettoUnit, conMargineUnit, qta, serviziUnit, granTotRiga, venduto, differenza, nettoCadSmart };
+}
+
+// -------------------- TABELLA: RENDER 1 VOLTA + UPDATE CELLE --------------------
+function renderTabellaArticoli() {
+  const tableBody = document.querySelector("#articoli-table tbody");
+  if (!tableBody) return;
+  tableBody.innerHTML = "";
+
+  articoliAggiunti.forEach((articolo, index) => {
+    const r = computeRow(articolo);
+
+    const row = document.createElement("tr");
+    row.dataset.index = String(index);
+
+    row.innerHTML = `
+      <td data-col="codice">${articolo.codice}</td>
+      <td data-col="descrizione">${articolo.descrizione}</td>
+
+      <td data-col="prezzoLordo" class="cell-prezzoLordo">${roundTwo(parseDec(articolo.prezzoLordo)).toFixed(2)}€</td>
+
+      <td data-col="sconto1">
+        <input class="cell-input" type="text" inputmode="decimal" autocomplete="off" spellcheck="false"
+          value="${fmtDec(r.sconto1, 2, true)}"
+          data-index="${index}" data-field="sconto" />
+      </td>
+
+      <td data-col="sconto2">
+        <input class="cell-input" type="text" inputmode="decimal" autocomplete="off" spellcheck="false"
+          value="${fmtDec(r.sconto2, 2, true)}"
+          data-index="${index}" data-field="sconto2" />
+      </td>
+
+      <td data-col="scontoCliente">
+        <input class="cell-input" type="text" inputmode="decimal" autocomplete="off" spellcheck="false"
+          value="${fmtDec(parseDec(articolo.scontoCliente || 0), 2, true)}"
+          data-index="${index}" data-field="scontoCliente" />
+      </td>
+
+      <td data-col="margine">
+        <input class="cell-input" type="text" inputmode="decimal" autocomplete="off" spellcheck="false"
+          value="${fmtDec(parseDec(articolo.margine || 0), 2, true)}"
+          data-index="${index}" data-field="margine" />
+      </td>
+
+      <td data-col="totaleNetto" class="cell-totaleNetto">${r.totaleNettoUnit.toFixed(2)}€</td>
+
+      <td data-col="trasporto">
+        <div class="tr-inline">
+          <input class="cell-input tr-input" type="text" inputmode="decimal" autocomplete="off" spellcheck="false"
+            value="${fmtDec(parseDec(articolo.costoTrasporto || 0), 2, true)}"
+            data-index="${index}" data-field="costoTrasporto" />
+          <button type="button" class="tr-btn" onclick="calcolaTrasporto(${index})">Calcola</button>
+        </div>
+      </td>
+
+      <td data-col="installazione">
+        <input class="cell-input" type="text" inputmode="decimal" autocomplete="off" spellcheck="false"
+          value="${fmtDec(parseDec(articolo.costoInstallazione || 0), 2, true)}"
+          data-index="${index}" data-field="costoInstallazione" />
+      </td>
+
+      <td data-col="qta">
+        <input class="cell-input" type="number" min="1" step="1"
+          value="${r.qta}"
+          data-index="${index}" data-field="quantita" />
+      </td>
+
+      <td data-col="granTot" class="cell-granTot">${r.granTotRiga.toFixed(2)}€</td>
+
+      <td data-col="venduto">
+        <input class="cell-input" type="text" inputmode="decimal" autocomplete="off" spellcheck="false"
+          value="${fmtDec(r.venduto, 2, true)}"
+          data-index="${index}" data-field="venduto" />
+      </td>
+
+      <td data-col="diff" class="cell-diff">${r.differenza.toFixed(2)}€</td>
+
+      <td data-col="azioni"><button onclick="rimuoviArticolo(${index})">Rimuovi</button></td>
+    `;
+
+    tableBody.appendChild(row);
+  });
+
+  // Delegation: una sola volta (ma sicuro) — rimuovo prima per evitare doppioni
+  tableBody.removeEventListener('input', onTableInput, true);
+  tableBody.addEventListener('input', onTableInput, true);
+
+  // Micro stile input (stabilizza layout)
+  tableBody.querySelectorAll('input.cell-input').forEach(inp => {
+    // Evita width inline: la larghezza su mobile è gestita da CSS (cards)
+    inp.style.boxSizing = 'border-box';
+  });
+
+  applyColumnVisibility();
+}
+
+function onTableInput(e) {
+  const target = e.target;
+  if (!(target instanceof HTMLInputElement)) return;
+
+  const idx = parseInt(target.dataset.index || '-1', 10);
+  const field = target.dataset.field || '';
+  if (idx < 0 || !field) return;
+
+  // Per i campi testuali decimali: permetti virgola e non distruggere il testo mentre digita
+  if (field !== 'quantita') {
+    const cleaned = sanitizeDecimalTyping(target.value);
+    if (cleaned !== target.value) {
+      const pos = target.selectionStart ?? cleaned.length;
+      target.value = cleaned;
+      try { target.setSelectionRange(pos, pos); } catch (_) {}
+    }
+  }
+
+  // Aggiorna solo il dato in memoria (senza re-render della tabella)
+  if (field === 'quantita') {
+    let v = parseInt(String(target.value || '1'), 10) || 1;
+    if (v < 1) v = 1;
+    articoliAggiunti[idx][field] = v;
+  } else {
+    let v = parseDec(target.value);
+    if (field === "sconto" || field === "sconto2" || field === "scontoCliente") v = clamp(v, 0, 100);
+    if (field === "margine") v = clamp(v, 0, 99.99);
+    if (field === "costoTrasporto" || field === "costoInstallazione" || field === "venduto") v = Math.max(0, v);
+
+    articoliAggiunti[idx][field] = v;
+
+    // se l'utente cambia sconto1/sconto2/margine mentre client mode è OFF,
+    // aggiorno "sconto cliente" mostrato sopra come equivalente (non tocco la tabella)
+    if (!smartSettings.showClientDiscount && (field === 'sconto' || field === 'sconto2' || field === 'margine')) {
+      articoliAggiunti[idx].scontoCliente = computeClientDiscountFromCurrent(articoliAggiunti[idx]);
+    }
+  }
+
+  // Aggiorna SOLO celle calcolate della riga (mantieni focus e caret)
+  aggiornaCalcoliRiga(idx);
+
+  // Totali e sconto equivalente
+  aggiornaTotaliGenerali();
+  updateEquivalentDiscountDisplay();
+}
+
+function aggiornaCalcoliRiga(index) {
+  const row = document.querySelector(`#articoli-table tbody tr[data-index="${index}"]`);
+  if (!row) return;
+
+  const articolo = articoliAggiunti[index];
+  const r = computeRow(articolo);
+
+  const tdTotaleNetto = row.querySelector('.cell-totaleNetto');
+  const tdGranTot = row.querySelector('.cell-granTot');
+  const tdDiff = row.querySelector('.cell-diff');
+  const tdPrezzoLordo = row.querySelector('.cell-prezzoLordo');
+
+  if (tdPrezzoLordo) tdPrezzoLordo.textContent = `${roundTwo(parseDec(articolo.prezzoLordo)).toFixed(2)}€`;
+  if (tdTotaleNetto) tdTotaleNetto.textContent = `${r.totaleNettoUnit.toFixed(2)}€`;
+  if (tdGranTot) tdGranTot.textContent = `${r.granTotRiga.toFixed(2)}€`;
+  if (tdDiff) tdDiff.textContent = `${r.differenza.toFixed(2)}€`;
+}
+
+function aggiornaCalcoliRighe() {
+  for (let i = 0; i < articoliAggiunti.length; i++) aggiornaCalcoliRiga(i);
+}
+
+// -------------------- RIMOZIONE --------------------
+
+// -------------------- TRASPORTI: LINK CALCOLO --------------------
+function calcolaTrasporto(index){
   try{
-    await navigator.clipboard.writeText(text);
-    UI.btnCopy.textContent = "Copiato ✓";
-    setTimeout(()=> UI.btnCopy.textContent="Copia riepilogo", 1000);
-  } catch {
-    const ta = document.createElement("textarea");
-    ta.value = text;
-    document.body.appendChild(ta);
-    ta.select();
-    document.execCommand("copy");
-    ta.remove();
+    const a = articoliAggiunti[index];
+    if(!a){ return; }
+
+    const code = String(a.codice || '').trim();
+    const q = `${a.codice} ${a.descrizione}`.trim();
+
+    // fallback logistico (estendibile)
+    let fallback = '';
+    const qU = q.toUpperCase();
+    if(qU.includes('822')) fallback = '820';
+
+    const url = `./trasporti/?code=${encodeURIComponent(code)}&q=${encodeURIComponent(q)}&fallback=${encodeURIComponent(fallback)}`;
+    window.open(url, '_blank', 'noopener');
+  } catch (e){
+    console.warn('Impossibile aprire Trasporti:', e);
   }
 }
 
-/* -------------------- INIT -------------------- */
+function rimuoviArticolo(index) {
+  window.track?.remove_item?.();
+  articoliAggiunti.splice(index, 1);
+  renderTabellaArticoli();
+  aggiornaTotaliGenerali();
+  updateEquivalentDiscountDisplay();
+}
 
-async function init(){
-  // PWA
-  if ("serviceWorker" in navigator){
-    try{
-      await navigator.serviceWorker.register("sw.js");
-      UI.pwaStatus.textContent = "Offline-ready: sì";
-    } catch(e){
-      UI.pwaStatus.textContent = "Offline-ready: no";
-    }
+// -------------------- TOTALI --------------------
+function aggiornaTotaliGenerali() {
+  let totaleSenzaServizi = 0;
+  let totaleConServizi = 0;
+  let totaleVenduto = 0;
+  let totaleDifferenzaSconto = 0;
+
+  articoliAggiunti.forEach(articolo => {
+    const r = computeRow(articolo);
+    totaleSenzaServizi += r.conMargineUnit * r.qta;
+    totaleConServizi += r.granTotRiga;
+    totaleVenduto += r.venduto;
+    totaleDifferenzaSconto += r.differenza;
+  });
+
+  const imponibile = autoPopolaCosti ? roundTwo(totaleConServizi) : roundTwo(totaleSenzaServizi);
+  const vatRate = clamp(parseDec(smartSettings.vatRate ?? 22), 0, 100);
+  const iva = roundTwo(imponibile * (vatRate / 100));
+  const totaleIvato = roundTwo(imponibile + iva);
+
+  let totaleDiv = document.getElementById("totaleGenerale");
+  if (!totaleDiv) {
+    totaleDiv = document.createElement("div");
+    totaleDiv.id = "totaleGenerale";
+    totaleDiv.style.padding = "1em";
+    document.getElementById("report-section").insertAdjacentElement("beforebegin", totaleDiv);
+  }
+
+  const smart = !!smartSettings.smartMode;
+
+  let html = "";
+  if (!smart) {
+    html += `<strong>Totale Netto (senza Trasporto/Installazione):</strong> ${totaleSenzaServizi.toFixed(2)}€<br>`;
+    html += `<strong>Totale Complessivo (inclusi Trasporto/Installazione):</strong> ${totaleConServizi.toFixed(2)}€<br>`;
+    html += `<strong>Totale Venduto:</strong> ${totaleVenduto.toFixed(2)}€<br>`;
+    html += `<strong>Totale Differenza Sconto:</strong> ${totaleDifferenzaSconto.toFixed(2)}€`;
   } else {
-    UI.pwaStatus.textContent = "Offline-ready: n/d";
-  }
-
-  // Load datasets
-  DB.articles = await loadJSON("data/articles.json");
-  DB.palletRates = await loadJSON("data/pallet_rates_by_region.json");
-  DB.groupageRates = await loadJSON("data/groupage_rates.json");
-
-  // GEO (province by region)
-  try{
-    GEO = await loadJSON("data/geo_provinces.json");
-  } catch {
-    GEO = null;
-  }
-
-  // Regions
-  const regions = DB.palletRates?.meta?.regions || Object.keys(DB.palletRates.rates || {});
-  fillSelect(UI.region, regions, { placeholder: "— Seleziona Regione —" });
-
-  // Provinces (UI: usa GEO se presente, altrimenti fallback)
-  // Fallback: prova a estrarre token (2 lettere) dalle chiavi groupage
-  const provFromGroupageKeys = [];
-  const groupKeys = Object.keys(DB.groupageRates?.provinces || {});
-  for(const k of groupKeys){
-    provFromGroupageKeys.push(...tokenizeProvinceGroupKey(k));
-    // se per caso hai anche province singole nel JSON:
-    if(/^[A-Z]{2}$/.test(k.toUpperCase().trim())) provFromGroupageKeys.push(normalizeProvince(k));
-  }
-  const allProvincesFallback = uniq(provFromGroupageKeys);
-
-  // se GEO c'è, la lista province di default la prendiamo dal groupage (fallback) ma poi filtriamo su change regione
-  fillSelect(UI.province, allProvincesFallback, { placeholder: "— Seleziona Provincia —" });
-
-  // Pallet types
-  const palletTypes =
-    DB.palletRates?.meta?.palletTypes ||
-    (regions[0] && DB.palletRates?.rates?.[regions[0]] ? Object.keys(DB.palletRates.rates[regions[0]]) : []);
-  fillSelect(UI.palletType, palletTypes, { placeholder: "— Seleziona tipo bancale —" });
-
-  // Articles
-  renderArticleList("");
-
-  // Groupage multi-carico UI (iniettato sotto il campo LM)
-  ensureGroupageCartUI();
-
-  // Share buttons (WhatsApp + TXT)
-  wireShareButtons();
-
-  // ✅ touched tracking (manual override)
-  if(UI.palletType) UI.palletType.addEventListener("change", () => markTouched(UI.palletType));
-  if(UI.lm) UI.lm.addEventListener("input", () => markTouched(UI.lm));
-  if(UI.quintali) UI.quintali.addEventListener("input", () => markTouched(UI.quintali));
-  if(UI.palletCount) UI.palletCount.addEventListener("input", () => markTouched(UI.palletCount));
-
-  // Live recalcolo (debounced) per flag/input: non rompe la logica, richiama onCalc() in modo leggero
-  let __liveT = null;
-  function triggerLiveRecalc(){
-    if(__liveT) clearTimeout(__liveT);
-    __liveT = setTimeout(() => { try{ onCalc(); }catch(e){} }, 80);
-  }
-
-  // Events
-  UI.service.addEventListener("change", () => {
-    applyServiceUI();
-    ensureGroupageCartUI();
-triggerLiveRecalc();
-  });
-  UI.q.addEventListener("input", () => renderArticleList(UI.q.value));
-  UI.article.addEventListener("change", onArticleChange);
-  UI.btnCalc.addEventListener("click", onCalc);
-  UI.btnCopy.addEventListener("click", onCopy);
-// Flag/opzioni: ricalcolo costo + prezzo cliente in tempo reale
-  const flagEls = [UI.optPreavviso, UI.optAssicurazione, UI.optSponda, UI.chkZona, UI.distKm, UI.qty, UI.palletType, UI.region, UI.province, UI.article, UI.search];
-  flagEls.forEach(el => {
-    if(!el) return;
-    el.addEventListener('input',  () => triggerLiveRecalc());
-    el.addEventListener('change', () => triggerLiveRecalc());
-  });
-
-
-  // Filter provinces when region changes
-  UI.region.addEventListener("change", () => {
-    const regRaw = UI.region.value;
-    const reg = regRaw; // GEO potrebbe essere in formato diverso
-    const allowed = (GEO && reg && GEO[reg]) ? GEO[reg].map(normalizeProvince) : null;
-
-    if(allowed && allowed.length){
-      fillSelect(UI.province, uniq(allowed), { placeholder: "— Seleziona Provincia —" });
+    html += `<strong>Imponibile:</strong> ${imponibile.toFixed(2)}€<br>`;
+    if (smartSettings.showVAT) {
+      html += `<strong>IVA (${vatRate.toFixed(1)}%):</strong> ${iva.toFixed(2)}€<br>`;
+      html += `<strong>Totale + IVA:</strong> ${totaleIvato.toFixed(2)}€`;
     } else {
-      fillSelect(UI.province, allProvincesFallback, { placeholder: "— Seleziona Provincia —" });
+      html += `<strong>Totale:</strong> ${imponibile.toFixed(2)}€`;
     }
-  });
+  }
 
-  UI.province.addEventListener("change", () => {
-    const v = normalizeProvince(UI.province.value);
-    if(UI.province.value !== v) UI.province.value = v;
-  });
+  if (!smart && smartSettings.showVAT) {
+    html += `<br><br><strong>Imponibile:</strong> ${imponibile.toFixed(2)}€<br>`;
+    html += `<strong>IVA (${vatRate.toFixed(1)}%):</strong> ${iva.toFixed(2)}€<br>`;
+    html += `<strong>Totale + IVA:</strong> ${totaleIvato.toFixed(2)}€`;
+  }
 
-  applyServiceUI();
-  UI.outText.textContent = "Pronto. Seleziona servizio, destinazione e articolo, poi Calcola.";
-  UI.dbgData.textContent = `articoli=${DB.articles.length} | regioni=${regions.length} | province=${(allProvincesFallback||[]).length}`;
+  totaleDiv.innerHTML = html;
 }
 
-window.addEventListener("DOMContentLoaded", init);
+// -------------------- MANUALE --------------------
+function mostraFormArticoloManuale() {
+  const tableBody = document.querySelector("#articoli-table tbody");
+  if (!tableBody) return;
+  if (document.getElementById("manual-input-row")) return;
+
+  const row = document.createElement("tr");
+  row.id = "manual-input-row";
+
+  row.innerHTML = `
+    <td data-col="codice"><input type="text" id="manualCodice" placeholder="Codice" /></td>
+    <td data-col="descrizione"><input type="text" id="manualDescrizione" placeholder="Descrizione" /></td>
+
+    <td data-col="prezzoLordo"><input type="text" inputmode="decimal" id="manualPrezzo" placeholder="€" value="0" /></td>
+
+    <td data-col="sconto1"><input type="text" inputmode="decimal" id="manualSconto1" placeholder="%" value="0" /></td>
+    <td data-col="sconto2"><input type="text" inputmode="decimal" id="manualSconto2" placeholder="%" value="0" /></td>
+
+    <td data-col="scontoCliente"><input type="text" inputmode="decimal" id="manualScontoCliente" placeholder="%" value="0" /></td>
+
+    <td data-col="margine"><input type="text" inputmode="decimal" id="manualMargine" placeholder="%" value="0" /></td>
+
+    <td data-col="totaleNetto"><span id="manualTotale">—</span></td>
+
+    <td data-col="trasporto"><input type="text" inputmode="decimal" id="manualTrasporto" placeholder="€" value="0" /></td>
+    <td data-col="installazione"><input type="text" inputmode="decimal" id="manualInstallazione" placeholder="€" value="0" /></td>
+
+    <td data-col="qta"><input type="number" id="manualQuantita" placeholder="1" value="1" min="1" step="1" /></td>
+
+    <td data-col="granTot"><span id="manualGranTotale">—</span></td>
+
+    <td data-col="venduto"><input type="text" inputmode="decimal" id="manualVenduto" placeholder="€" value="0" /></td>
+    <td data-col="diff"><span id="manualDifferenza">—</span></td>
+
+    <td data-col="azioni">
+      <button onclick="aggiungiArticoloManuale()">✅</button>
+      <button onclick="annullaArticoloManuale()">❌</button>
+    </td>
+  `;
+
+  tableBody.appendChild(row);
+
+  [
+    "manualPrezzo", "manualSconto1", "manualSconto2", "manualScontoCliente", "manualMargine",
+    "manualTrasporto", "manualInstallazione", "manualQuantita", "manualVenduto"
+  ].forEach(id => {
+    const el = document.getElementById(id);
+    if (!el) return;
+    el.addEventListener("input", () => {
+      if (el.type === 'text') el.value = sanitizeDecimalTyping(el.value);
+      calcolaRigaManuale();
+    });
+  });
+
+  applyColumnVisibility();
+  calcolaRigaManuale();
+}
+
+function calcolaRigaManuale() {
+  const prezzoLordo = parseDec(document.getElementById("manualPrezzo").value);
+
+  const sconto1 = clamp(parseDec(document.getElementById("manualSconto1").value), 0, 100);
+  const sconto2 = clamp(parseDec(document.getElementById("manualSconto2").value), 0, 100);
+  const scontoCliente = clamp(parseDec(document.getElementById("manualScontoCliente").value), 0, 100);
+
+  const margine = clamp(parseDec(document.getElementById("manualMargine").value), 0, 99.99);
+
+  const trasporto = Math.max(0, parseDec(document.getElementById("manualTrasporto").value));
+  const installazione = Math.max(0, parseDec(document.getElementById("manualInstallazione").value));
+  const quantita = Math.max(1, parseInt(document.getElementById("manualQuantita").value || '1', 10) || 1);
+  const venduto = Math.max(0, parseDec(document.getElementById("manualVenduto").value));
+
+  let conMargine = 0;
+  let nettoMostrato = 0;
+
+  if (smartSettings.showClientDiscount) {
+    conMargine = roundTwo(prezzoLordo * (1 - scontoCliente / 100));
+    nettoMostrato = conMargine;
+  } else {
+    const scontato = roundTwo(prezzoLordo * (1 - sconto1 / 100) * (1 - sconto2 / 100));
+    conMargine = roundTwo(scontato / (1 - margine / 100));
+    nettoMostrato = scontato;
+  }
+
+  const granTot = roundTwo((conMargine + trasporto + installazione) * quantita);
+  const differenza = roundTwo(venduto - granTot);
+
+  document.getElementById("manualTotale").textContent = nettoMostrato.toFixed(2) + "€";
+  document.getElementById("manualGranTotale").textContent = granTot.toFixed(2) + "€";
+  document.getElementById("manualDifferenza").textContent = differenza.toFixed(2) + "€";
+}
+
+function aggiungiArticoloManuale() {
+  window.track?.add_item_manual?.();
+
+  const codice = document.getElementById("manualCodice").value.trim();
+  const descrizione = document.getElementById("manualDescrizione").value.trim();
+
+  const prezzoLordo = parseDec(document.getElementById("manualPrezzo").value);
+  const sconto = clamp(parseDec(document.getElementById("manualSconto1").value), 0, 100);
+  const sconto2 = clamp(parseDec(document.getElementById("manualSconto2").value), 0, 100);
+  const scontoCliente = clamp(parseDec(document.getElementById("manualScontoCliente").value), 0, 100);
+  const margine = clamp(parseDec(document.getElementById("manualMargine").value), 0, 99.99);
+
+  const costoTrasporto = Math.max(0, parseDec(document.getElementById("manualTrasporto").value));
+  const costoInstallazione = Math.max(0, parseDec(document.getElementById("manualInstallazione").value));
+  const quantita = Math.max(1, parseInt(document.getElementById("manualQuantita").value || '1', 10) || 1);
+  const venduto = Math.max(0, parseDec(document.getElementById("manualVenduto").value));
+
+  const nuovoArticolo = {
+    codice,
+    descrizione,
+    prezzoLordo,
+    sconto,
+    sconto2,
+    margine,
+    scontoCliente,
+    costoTrasporto,
+    costoInstallazione,
+    quantita,
+    venduto
+  };
+
+  // se la modalità è attiva, allinea scontoCliente equivalente
+  if (smartSettings.showClientDiscount) {
+    nuovoArticolo.scontoCliente = computeClientDiscountFromCurrent(nuovoArticolo);
+    nuovoArticolo.sconto = 0;
+    nuovoArticolo.sconto2 = 0;
+    nuovoArticolo.margine = 0;
+  }
+
+  articoliAggiunti.push(nuovoArticolo);
+
+  annullaArticoloManuale();
+  renderTabellaArticoli();
+  aggiornaTotaliGenerali();
+  updateEquivalentDiscountDisplay();
+}
+
+function annullaArticoloManuale() {
+  const row = document.getElementById("manual-input-row");
+  if (row) row.remove();
+}
+
+// -------------------- REPORTS --------------------
+function generaReportSmartCliente() {
+  let report = "PREVENTIVO / ORDINE\n\n";
+  let imponibile = 0;
+
+  const checkboxServizi = document.getElementById("toggleMostraServizi");
+  const mostraServizi = checkboxServizi && checkboxServizi.checked && autoPopolaCosti;
+
+  articoliAggiunti.forEach((articolo, index) => {
+    const r = computeRow(articolo);
+
+    const nettoCad = r.nettoCadSmart;
+    const qta = r.qta;
+    const totRiga = r.granTotRiga;
+
+    imponibile += totRiga;
+
+    report += `${index + 1}) ${articolo.descrizione}\n`;
+    report += `Codice: ${articolo.codice}\n`;
+    report += `Q.tà: ${qta}\n`;
+    report += `Netto/cad: ${nettoCad.toFixed(2)}€\n`;
+
+    if (mostraServizi) {
+      const tr = roundTwo(parseDec(articolo.costoTrasporto || 0));
+      const ins = roundTwo(parseDec(articolo.costoInstallazione || 0));
+      if (tr !== 0 || ins !== 0) {
+        report += `Servizi:\n`;
+        report += `Trasporto ${tr.toFixed(2)}€\n`;
+        report += `Installazione ${ins.toFixed(2)}€\n`;
+      }
+    }
+
+    report += `Totale riga: ${totRiga.toFixed(2)}€\n\n`;
+  });
+
+  imponibile = roundTwo(imponibile);
+
+  const vatRate = clamp(parseDec(smartSettings.vatRate ?? 22), 0, 100);
+  const iva = roundTwo(imponibile * (vatRate / 100));
+  const totaleIvato = roundTwo(imponibile + iva);
+
+  report += `RIEPILOGO\n`;
+  report += `Imponibile: ${imponibile.toFixed(2)}€\n`;
+
+  if (smartSettings.showVAT) {
+    report += `IVA (${vatRate.toFixed(1)}%): ${iva.toFixed(2)}€\n`;
+    report += `Totale + IVA: ${totaleIvato.toFixed(2)}€\n`;
+  } else {
+    report += `Totale: ${imponibile.toFixed(2)}€\n`;
+  }
+
+  return report;
+}
+
+function generaReportTesto() {
+  if (smartSettings.smartMode) return generaReportSmartCliente();
+
+  let report = "Report Articoli:\n\n";
+  let totaleSenzaServizi = 0;
+  let totaleConServizi = 0;
+  let sommaDifferenze = 0;
+  let totaleVenduto = 0;
+
+  const checkboxServizi = document.getElementById("toggleMostraServizi");
+  mostraDettagliServizi = checkboxServizi && checkboxServizi.checked;
+
+  const clientMode = !!smartSettings.showClientDiscount;
+
+  articoliAggiunti.forEach((articolo, index) => {
+    const r = computeRow(articolo);
+
+    sommaDifferenze += r.differenza;
+    totaleVenduto += r.venduto;
+    totaleSenzaServizi += r.conMargineUnit * r.qta;
+    totaleConServizi += r.granTotRiga;
+
+    report += `${index + 1}. Codice: ${articolo.codice}\n`;
+    report += `Descrizione: ${articolo.descrizione}\n`;
+    report += `Prezzo netto: ${r.totaleNettoUnit.toFixed(2)}€\n`;
+
+    if (!smartSettings.hideDiscounts) {
+      if (clientMode) {
+        report += `Sconto cliente: ${clamp(parseDec(articolo.scontoCliente || 0), 0, 100).toFixed(2)}%\n`;
+      } else {
+        report += `Sconto 1: ${r.sconto1}%\n`;
+        report += `Sconto 2: ${r.sconto2}%\n`;
+      }
+    }
+
+    report += `Quantità: ${r.qta}\n`;
+
+    if (mostraDettagliServizi && autoPopolaCosti) {
+      report += `Trasporto: ${roundTwo(parseDec(articolo.costoTrasporto || 0)).toFixed(2)}€\n`;
+      report += `Installazione: ${roundTwo(parseDec(articolo.costoInstallazione || 0)).toFixed(2)}€\n`;
+    }
+
+    report += `Totale: ${r.granTotRiga.toFixed(2)}€\n`;
+
+    if (!smartSettings.hideVenduto) report += `Venduto A: ${(r.venduto || 0).toFixed(2)}€\n`;
+    if (!smartSettings.hideDiff) report += `Differenza sconto: ${r.differenza.toFixed(2)}€\n`;
+
+    report += `\n`;
+  });
+
+  report += `Totale Netto (senza Trasporto/Installazione): ${totaleSenzaServizi.toFixed(2)}€\n`;
+  if (autoPopolaCosti) report += `Totale Complessivo (inclusi Trasporto/Installazione): ${totaleConServizi.toFixed(2)}€\n`;
+
+  if (!smartSettings.hideVenduto) report += `Totale Venduto: ${totaleVenduto.toFixed(2)}€\n`;
+  if (!smartSettings.hideDiff) report += `Totale Differenza Sconto: ${sommaDifferenze.toFixed(2)}€\n`;
+
+  if (smartSettings.showVAT) {
+    const imponibile = autoPopolaCosti ? roundTwo(totaleConServizi) : roundTwo(totaleSenzaServizi);
+    const vatRate = clamp(parseDec(smartSettings.vatRate ?? 22), 0, 100);
+    const iva = roundTwo(imponibile * (vatRate / 100));
+    const totaleIvato = roundTwo(imponibile + iva);
+
+    report += `\nRIEPILOGO IVA\n`;
+    report += `Imponibile: ${imponibile.toFixed(2)}€\n`;
+    report += `IVA (${vatRate.toFixed(1)}%): ${iva.toFixed(2)}€\n`;
+    report += `Totale + IVA: ${totaleIvato.toFixed(2)}€\n`;
+  }
+
+  return report;
+}
+
+function inviaReportWhatsApp() {
+  window.track?.report_whatsapp?.({ variant: smartSettings.smartMode ? 'smart' : (smartSettings.showClientDiscount ? 'client_discount' : 'standard') });
+  const report = generaReportTesto();
+  const whatsappUrl = "https://api.whatsapp.com/send?text=" + encodeURIComponent(report);
+  window.open(whatsappUrl, '_blank');
+}
+
+function generaPDFReport() {
+  window.track?.csv_export?.({ format: smartSettings.smartMode ? 'txt_smart' : (smartSettings.showClientDiscount ? 'txt_client_discount' : 'txt_standard') });
+  const report = generaReportTesto();
+  const blob = new Blob([report], { type: "text/plain" });
+  const link = document.createElement("a");
+  link.href = URL.createObjectURL(blob);
+  link.download = smartSettings.smartMode ? "preventivo_smart.txt" : "report.txt";
+  document.body.appendChild(link);
+  link.click();
+  document.body.removeChild(link);
+}
+
+function generaReportTestoSenzaMargine() {
+  if (smartSettings.smartMode) return generaReportSmartCliente();
+
+  let report = "Report Articoli (senza Margine):\n\n";
+  let totaleSenzaServizi = 0;
+  let totaleConServizi = 0;
+
+  const checkboxServizi = document.getElementById("toggleMostraServizi");
+  const mostraServizi = checkboxServizi && checkboxServizi.checked;
+
+  const clientMode = !!smartSettings.showClientDiscount;
+
+  articoliAggiunti.forEach((articolo, index) => {
+    const prezzoLordo = parseDec(articolo.prezzoLordo || 0);
+    const quantita = Math.max(1, parseInt(articolo.quantita || 1, 10) || 1);
+
+    let prezzoNetto = 0;
+
+    if (clientMode) {
+      const sc = clamp(parseDec(articolo.scontoCliente || 0), 0, 100);
+      prezzoNetto = roundTwo(prezzoLordo * (1 - sc / 100));
+    } else {
+      const sconto1 = clamp(parseDec(articolo.sconto || 0), 0, 100);
+      const sconto2 = clamp(parseDec(articolo.sconto2 || 0), 0, 100);
+      prezzoNetto = roundTwo(prezzoLordo * (1 - sconto1 / 100) * (1 - sconto2 / 100));
+    }
+
+    const granTotale =
+      (prezzoNetto + Math.max(0, parseDec(articolo.costoTrasporto || 0)) + Math.max(0, parseDec(articolo.costoInstallazione || 0)))
+      * quantita;
+
+    const granTotaleFinal = roundTwo(granTotale);
+
+    totaleSenzaServizi += prezzoNetto * quantita;
+    totaleConServizi += granTotaleFinal;
+
+    report += `${index + 1}. Codice: ${articolo.codice}\n`;
+    report += `Descrizione: ${articolo.descrizione}\n`;
+    report += `Prezzo netto: ${prezzoNetto.toFixed(2)}€\n`;
+
+    if (!smartSettings.hideDiscounts) {
+      if (clientMode) {
+        report += `Sconto cliente: ${clamp(parseDec(articolo.scontoCliente || 0), 0, 100).toFixed(2)}%\n`;
+      } else {
+        report += `Sconto 1: ${clamp(parseDec(articolo.sconto || 0), 0, 100)}%\n`;
+        report += `Sconto 2: ${clamp(parseDec(articolo.sconto2 || 0), 0, 100)}%\n`;
+      }
+    }
+
+    report += `Quantità: ${quantita}\n`;
+
+    if (mostraServizi && autoPopolaCosti) {
+      report += `Trasporto: ${roundTwo(parseDec(articolo.costoTrasporto || 0)).toFixed(2)}€\n`;
+      report += `Installazione: ${roundTwo(parseDec(articolo.costoInstallazione || 0)).toFixed(2)}€\n`;
+    }
+
+    report += `Totale: ${granTotaleFinal.toFixed(2)}€\n\n`;
+  });
+
+  report += `Totale Netto (senza Trasporto/Installazione): ${totaleSenzaServizi.toFixed(2)}€\n`;
+  if (autoPopolaCosti) report += `Totale Complessivo (inclusi Trasporto/Installazione): ${totaleConServizi.toFixed(2)}€\n`;
+
+  if (smartSettings.showVAT) {
+    const imponibile = autoPopolaCosti ? roundTwo(totaleConServizi) : roundTwo(totaleSenzaServizi);
+    const vatRate = clamp(parseDec(smartSettings.vatRate ?? 22), 0, 100);
+    const iva = roundTwo(imponibile * (vatRate / 100));
+    const totaleIvato = roundTwo(imponibile + iva);
+
+    report += `\nRIEPILOGO IVA\n`;
+    report += `Imponibile: ${imponibile.toFixed(2)}€\n`;
+    report += `IVA (${vatRate.toFixed(1)}%): ${iva.toFixed(2)}€\n`;
+    report += `Totale + IVA: ${totaleIvato.toFixed(2)}€\n`;
+  }
+
+  return report;
+}
+
+function inviaReportWhatsAppSenzaMargine() {
+  window.track?.report_whatsapp?.({ variant: smartSettings.smartMode ? 'smart' : (smartSettings.showClientDiscount ? 'client_discount_no_margin' : 'no_margin') });
+  const report = generaReportTestoSenzaMargine();
+  const whatsappUrl = "https://api.whatsapp.com/send?text=" + encodeURIComponent(report);
+  window.open(whatsappUrl, '_blank');
+}
+
+function generaTXTReportSenzaMargine() {
+  window.track?.csv_export?.({ format: smartSettings.smartMode ? 'txt_smart' : (smartSettings.showClientDiscount ? 'txt_client_discount_no_margin' : 'txt_no_margin') });
+  const report = generaReportTestoSenzaMargine();
+  const blob = new Blob([report], { type: "text/plain" });
+  const link = document.createElement("a");
+  link.href = URL.createObjectURL(blob);
+  link.download = smartSettings.smartMode ? "preventivo_smart.txt" : "report_senza_margine.txt";
+  document.body.appendChild(link);
+  link.click();
+  document.body.removeChild(link);
+}
