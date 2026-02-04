@@ -608,7 +608,15 @@ function searchArticles(q){
   if(!raw) return DB.articles.slice(0, 200);
 
   const tokens = raw.split(/\s+/g).map(s => s.trim()).filter(Boolean);
-  const wordTokens = tokens.map(t => t.toLowerCase());
+
+  // IMPORTANT:
+  // - token puramente numerici (es. 00100208) NON devono "bloccare" la ricerca
+  //   perché spesso arrivano dal listino CSV e non esistono nel dataset Trasporti.
+  // - i numeri rimangono utili come BOOST (score) quando matchano (820, 10, ecc.)
+  const wordTokens = tokens
+    .map(t => t.toLowerCase())
+    .filter(t => !/^\d{3,}$/.test(t)); // esclude solo-numeri >= 3 cifre
+
   const codeTokens = tokens
     .map(t => t.replace(/[^0-9]/g,""))
     .filter(t => t.length >= 3); // es. 820, 00100208
@@ -634,18 +642,30 @@ function searchArticles(q){
       const tN = normalizeCode(t);
       const ok = hay.includes(t) || (tN && hayN.includes(tN));
       if(!ok){
-        return null; // fail hard: parola mancante
+        return null;
       }
-      score += 5;
+      // peso parole
+      score += Math.min(10, t.length);
     }
 
-    // numeri: opzionali; se matchano migliorano score
-    for(const n of codeTokens){
-      if(codeN.includes(n)) score += 10;
-      else if(hayN.includes(n)) score += 3;
+    // numeri: aumentano lo score se matchano (non obbligatori)
+    for(const c of codeTokens){
+      const cN = normalizeCode(c);
+      if(!cN) continue;
+
+      if(codeN.includes(cN) || hayN.includes(cN)){
+        // match forte su numero
+        score += 18;
+      }
     }
 
-    // boost se match perfetto di codice (quando query sembra un codice)
+    // bonus: match su prefisso code
+    if(code && tokens.length){
+      const t0 = normalizeCode(tokens[0] || "");
+      if(t0 && codeN.startsWith(t0)) score += 12;
+    }
+
+    // exact code match
     const rawN = normalizeCode(raw);
     if(rawN && codeN === rawN) score += 30;
 
@@ -671,40 +691,66 @@ function renderArticleList(q){
 // Prefill da querystring (es. ?q=PUMA%20CE...&fallback=820) — apre già l'articolo suggerito ma resta modificabile
 function prefillFromQuery(){
   const params = new URLSearchParams(location.search);
-  let q = (params.get("q") || "").trim();
-  const fallback = (params.get("fallback") || "").trim();
+  const rawQ = (params.get("q") || "").trim();
+  const explicitFallback = (params.get("fallback") || "").trim();
 
-  // fallback "interno" (se non passato) — estendibile
+  // fallback "interno" (estendibile)
   const FALLBACK_MAP = { "822": "820" };
 
-  if(!q) return;
+  if(!rawQ || !UI.q) return;
 
-  // imposta ricerca + lista
-  if(UI.q){
-    UI.q.value = q;
-    const n = renderArticleList(q);
+  const stripNumericTokens = (s) => String(s||"")
+    .split(/\s+/g)
+    .filter(t => t && !/^\d{3,}$/.test(t))   // toglie codici tipo 00100208
+    .join(" ")
+    .trim();
 
-    // se non trovo nulla, provo fallback esplicito oppure mappa interna (es. 822 -> 820)
-    if(n === 0){
-      let fb = fallback;
-      if(!fb){
-        const up = q.toUpperCase();
-        for(const k of Object.keys(FALLBACK_MAP)){
-          if(up.includes(k)){
-            fb = FALLBACK_MAP[k];
-            break;
-          }
-        }
-      }
-      if(fb){
-        UI.q.value = fb;
-        renderArticleList(fb);
-      }
+  const deriveFallback = (s) => {
+    const up = String(s||"").toUpperCase();
+    // (1) fallback esplicito
+    if(explicitFallback) return explicitFallback;
+
+    // (2) mappa interna (es. 822 -> 820)
+    for(const k of Object.keys(FALLBACK_MAP)){
+      if(up.includes(k)) return FALLBACK_MAP[k];
     }
 
-    // forza UI update anche se value è settato via JS
-    try{ UI.q.dispatchEvent(new Event("input", { bubbles:true })); }catch(e){}
+    // (3) prova a estrarre pattern "MEC 8xx" e usare lo stesso 8xx
+    const m = up.match(/\bMEC\s*([0-9]{3})\b/);
+    if(m && m[1]) return m[1];
+
+    return "";
+  };
+
+  // tenta più varianti, così il menu a tendina resta popolato anche se il "q" arriva dal CSV
+  const candidates = [];
+  const q1 = rawQ;
+  const q2 = stripNumericTokens(rawQ);
+  const fb = deriveFallback(rawQ);
+  const q3 = fb ? fb : "";
+  const q4 = fb ? stripNumericTokens(fb) : "";
+
+  for(const c of [q1, q2, q3, q4]){
+    const cc = String(c||"").trim();
+    if(cc && !candidates.includes(cc)) candidates.push(cc);
   }
+
+  let used = q1;
+  let found = 0;
+
+  for(const c of candidates){
+    found = renderArticleList(c);
+    if(found > 0){
+      used = c;
+      break;
+    }
+  }
+
+  // se abbiamo cambiato query, rendiamolo evidente e coerente con la dropdown
+  UI.q.value = used;
+
+  // forza UI update anche se value è settato via JS
+  try{ UI.q.dispatchEvent(new Event("input", { bubbles:true })); }catch(e){}
 
   // prova a selezionare automaticamente il primo risultato utile (placeholder è index 0)
   setTimeout(() => {
