@@ -1,25 +1,29 @@
 <!DOCTYPE html>
-<html lang="it" data-app="CSVXPRESSTRANS" data-ver="1.0.0">
+<html lang="it" data-app="CSVXPRESSTRANS" data-ver="1.0.1">
 <head>
   <meta charset="utf-8"/>
   <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover"/>
   <title>CSVXPRESSTRANS</title>
 
+  <!-- Base path robusto per sottocartelle (GitHub Pages /CSVXPRESSTRANS/) -->
+  <base href="./">
+
   <!-- PWA -->
-  <link rel="manifest" href="manifest.json"/>
+  <link rel="manifest" href="./manifest.json"/>
   <meta name="theme-color" content="#0b0f14"/>
 
-  <!-- Styles (CSVXpressSmart) -->
-  <link rel="stylesheet" href="style.css"/>
-  <link rel="stylesheet" href="style.mobile.cards.rev.v3.css"/>
-
-  <!-- Apple / iOS -->
+  <!-- iOS install -->
   <meta name="apple-mobile-web-app-capable" content="yes"/>
-  <meta name="apple-mobile-web-app-status-bar-style" content="default"/>
+  <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent"/>
+  <meta name="apple-mobile-web-app-title" content="CSVXtrans"/>
   <meta name="format-detection" content="telephone=no"/>
-  <link rel="apple-touch-icon" href="icons/icon-192.png"/>
+  <link rel="apple-touch-icon" href="./icons/icon-192.png"/>
 
-  <!-- (facoltativo) micro-fix: evita che modali/overlay blocchino tutto -->
+  <!-- Styles -->
+  <link rel="stylesheet" href="./style.css"/>
+  <link rel="stylesheet" href="./style.mobile.cards.rev.v3.css"/>
+
+  <!-- Micro-fix UI -->
   <style>
     .sr-only{
       position:absolute!important;width:1px;height:1px;padding:0;margin:-1px;overflow:hidden;
@@ -35,22 +39,30 @@
       font-weight:700; text-decoration:none;
       background:#b28cff; color:#111;
     }
-    .hint{
-      opacity:.75; font-size:13px;
-    }
+    .hint{ opacity:.75; font-size:13px; }
   </style>
 
   <!-- PapaParse (CSV) -->
   <script defer src="https://cdnjs.cloudflare.com/ajax/libs/PapaParse/5.3.2/papaparse.min.js"></script>
 
   <!-- App -->
-  <script defer src="app.js"></script>
+  <script defer src="./app.js"></script>
+
+  <!-- Service Worker: registra SOLO il wrapper sw.js -->
+  <script>
+    if ('serviceWorker' in navigator) {
+      window.addEventListener('load', () => {
+        navigator.serviceWorker.register('./sw.js', { scope: './' })
+          .catch(err => console.warn('SW register failed:', err));
+      });
+    }
+  </script>
 </head>
 
 <body>
 <header data-zone="header">
   <div class="logo-container">
-    <img class="logo" src="icons/icon-192.png" alt="CSVXPRESSTRANS Logo"/>
+    <img class="logo" src="./icons/icon-192.png" alt="CSVXPRESSTRANS Logo"/>
     <h1>CSVXPRESSTRANS</h1>
   </div>
 </header>
@@ -102,11 +114,11 @@
         🚚 Trasporti Use Friendly
       </a>
       <span class="hint">
-        Si apre in nuova scheda. Il pulsante “Calcola” nella colonna Trasporto aprirà questa PWA.
+        Il pulsante “Calcola” nella colonna Trasporto apre Trasporti già precompilato (codice/descrizione + fallback).
       </span>
     </div>
 
-    <!-- Controlli Smart (se usati da app.js) -->
+    <!-- Controlli Smart -->
     <div class="smart-controls" id="smart-controls">
       <h3>Modalità Preventivo / Ordine (Smart)</h3>
 
@@ -152,33 +164,6 @@
     <div id="reportPreview" class="report-preview" style="margin-top:14px; display:none;"></div>
   </section>
 </main>
-
-<!-- Intercetta il “Calcola” trasporto e apri la PWA Trasporti -->
-<script>
-  (function(){
-    const TR_URL = './trasporti/';
-
-    document.addEventListener('click', function(e){
-      // se il tuo app.js mette data-action="calc_tr" sul bottone “Calcola”
-      const btn = e.target && e.target.closest && e.target.closest('button[data-action="calc_tr"]');
-      if(btn){
-        e.preventDefault();
-        window.open(TR_URL, '_blank', 'noopener');
-        return;
-      }
-      // fallback: se hai un bottone con testo "Calcola" dentro la cella trasporto
-      const maybe = e.target && e.target.closest && e.target.closest('button');
-      if(maybe && (maybe.textContent || '').trim().toLowerCase() === 'calcola'){
-        // evita falsi positivi: apri solo se il bottone sta dentro la tabella articoli
-        const inTable = maybe.closest('#articoli-table');
-        if(inTable){
-          e.preventDefault();
-          window.open(TR_URL, '_blank', 'noopener');
-        }
-      }
-    });
-  })();
-</script>
 
 </body>
 </html>
