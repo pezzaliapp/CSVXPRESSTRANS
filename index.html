@@ -5,10 +5,8 @@
   <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover"/>
   <title>CSVXPRESSTRANS</title>
 
-  <base href="./">
-
   <!-- PWA -->
-  <link rel="manifest" href="./manifest.json"/>
+  <link rel="manifest" href="manifest.json"/>
   <meta name="theme-color" content="#0b0f14"/>
 
   <!-- iOS install -->
@@ -16,12 +14,13 @@
   <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent"/>
   <meta name="apple-mobile-web-app-title" content="CSVXtrans"/>
   <meta name="format-detection" content="telephone=no"/>
-  <link rel="apple-touch-icon" href="./icons/icon-192.png"/>
+  <link rel="apple-touch-icon" href="icons/icon-192.png"/>
 
   <!-- Styles -->
-  <link rel="stylesheet" href="./style.css"/>
-  <link rel="stylesheet" href="./style.mobile.cards.rev.v3.css"/>
+  <link rel="stylesheet" href="style.css"/>
+  <link rel="stylesheet" href="style.mobile.cards.rev.v3.css"/>
 
+  <!-- Micro-fix UI -->
   <style>
     .sr-only{
       position:absolute!important;width:1px;height:1px;padding:0;margin:-1px;overflow:hidden;
@@ -38,27 +37,15 @@
       background:#b28cff; color:#111;
     }
     .hint{ opacity:.75; font-size:13px; }
-
-    /* pannello manuale (compatibilità: se app.js lo usa) */
-    #manualAddPanel{
-      display:none;
-      margin-top:10px;
-      padding:12px;
-      border:1px solid rgba(0,0,0,.12);
-      border-radius:12px;
-      background:#fff;
-    }
-    #manualAddPanel .row{ display:flex; gap:8px; flex-wrap:wrap; margin:8px 0; }
-    #manualAddPanel input{ min-width:140px; }
   </style>
 
   <!-- PapaParse (CSV) -->
   <script defer src="https://cdnjs.cloudflare.com/ajax/libs/PapaParse/5.3.2/papaparse.min.js"></script>
 
   <!-- App -->
-  <script defer src="./app.js"></script>
+  <script defer src="app.js"></script>
 
-  <!-- Service Worker: registra SOLO sw.js -->
+  <!-- Service Worker: registra SOLO il wrapper sw.js -->
   <script>
     if ('serviceWorker' in navigator) {
       window.addEventListener('load', () => {
@@ -72,7 +59,7 @@
 <body>
 <header data-zone="header">
   <div class="logo-container">
-    <img class="logo" src="./icons/icon-192.png" alt="CSVXPRESSTRANS Logo"/>
+    <img class="logo" src="icons/icon-192.png" alt="CSVXPRESSTRANS Logo"/>
     <h1>CSVXPRESSTRANS</h1>
   </div>
 </header>
@@ -88,6 +75,7 @@
     <input id="csvFileInput" type="file" accept=".csv" aria-label="Seleziona file CSV"/>
     <p id="csvError" style="color:red; display:none;">Errore nel caricamento del file CSV.</p>
 
+    <!-- Memoria CSV -->
     <div class="csv-memory" id="csv-memory" style="margin-top:12px;">
       <h3 style="margin:0 0 6px 0;">Memoria CSV</h3>
       <label class="chk" style="display:block; margin:6px 0;">
@@ -109,29 +97,8 @@
     <h2>Filtra e Seleziona Articolo dal Listino</h2>
     <label for="searchListino">Cerca: </label>
     <input id="searchListino" type="text" placeholder="Inserisci codice o descrizione"/>
-
-    <select id="listinoSelect">
-      <option value="">— Seleziona articolo —</option>
-    </select>
-
+    <select id="listinoSelect"></select>
     <button id="btnAddFromListino" type="button">Aggiungi Articolo</button>
-
-    <!-- ✅ COMPATIBILITÀ: molti app.js si aspettano questo bottone -->
-    <button id="btnAddManual" type="button">Aggiungi Articolo Manualmente</button>
-
-    <!-- pannello manuale (nascosto): se app.js lo usa, non va in crash -->
-    <div id="manualAddPanel" aria-hidden="true">
-      <strong>Aggiunta manuale</strong>
-      <div class="row">
-        <input id="manualCode" type="text" placeholder="Codice"/>
-        <input id="manualDesc" type="text" placeholder="Descrizione"/>
-        <input id="manualPrice" type="text" inputmode="decimal" placeholder="Prezzo lordo"/>
-      </div>
-      <div class="row">
-        <button id="btnManualConfirm" type="button">Aggiungi</button>
-        <button id="btnManualCancel" type="button">Annulla</button>
-      </div>
-    </div>
   </section>
 
   <!-- ARTICOLI -->
@@ -150,7 +117,6 @@
     <div class="smart-controls" id="smart-controls">
       <h3>Modalità Preventivo / Ordine (Smart)</h3>
       <label class="chk"><input id="toggleShowVAT" type="checkbox"/> Mostra IVA</label>
-
       <div class="vat-row">
         <label for="vatRate">IVA %</label>
         <input id="vatRate" type="text" inputmode="decimal" value="22" autocomplete="off" spellcheck="false"/>
@@ -163,18 +129,18 @@
           <th data-col="codice">Codice</th>
           <th data-col="descrizione">Descrizione</th>
           <th data-col="prezzo">P. Lordo</th>
-          <th data-col="sconto" title="Sconto 1%">Sc.1%</th>
-          <th data-col="sconto2" title="Sconto 2%">Sc.2%</th>
-          <th data-col="scontoCliente" title="Sconto cliente %">Sc.Cliente%</th>
-          <th data-col="margine" title="Margine %">Marg.%</th>
-          <th data-col="totaleNetto" title="Totale">Totale</th>
-          <th data-col="trasporto" title="Trasporto">Trasp.</th>
-          <th data-col="installazione" title="Installazione">Inst.</th>
-          <th data-col="qta" title="Quantità">Qtà</th>
-          <th data-col="granTot" title="Gran Totale">Tot.</th>
-          <th data-col="venduto" title="Venduto A €">Vend.€</th>
-          <th data-col="diff" title="Differenza sconto">Diff.</th>
-          <th data-col="azioni" title="Azioni">Az.</th>
+          <th data-col="sconto">Sc.1%</th>
+          <th data-col="sconto2">Sc.2%</th>
+          <th data-col="scontoCliente">Sc.Cliente%</th>
+          <th data-col="margine">Marg.%</th>
+          <th data-col="totaleNetto">Totale</th>
+          <th data-col="trasporto">Trasp.</th>
+          <th data-col="installazione">Inst.</th>
+          <th data-col="qta">Qtà</th>
+          <th data-col="granTot">Tot.</th>
+          <th data-col="venduto">Vend.€</th>
+          <th data-col="diff">Diff.</th>
+          <th data-col="azioni">Az.</th>
         </tr>
       </thead>
       <tbody></tbody>
