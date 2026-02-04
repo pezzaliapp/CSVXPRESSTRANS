@@ -604,56 +604,115 @@ function applyServiceUI(){
 }
 
 function searchArticles(q){
-  const t = (q || "").trim().toLowerCase();
-  if(!t) return DB.articles.slice(0, 200);
+  const raw = String(q || "").trim();
+  if(!raw) return DB.articles.slice(0, 200);
 
-  const tn = normalizeCode(t);
+  const tokens = raw.split(/\s+/g).map(s => s.trim()).filter(Boolean);
+  const wordTokens = tokens.map(t => t.toLowerCase());
+  const codeTokens = tokens
+    .map(t => t.replace(/[^0-9]/g,""))
+    .filter(t => t.length >= 3); // es. 820, 00100208
 
-  return DB.articles
-    .filter(a => {
-      const codeN = normalizeCode(a.code || "");
-      const name = (a.name||"").toLowerCase();
-      const brand = (a.brand||"").toLowerCase();
-      const tags = (a.tags||[]).join(" ").toLowerCase();
-      return (
-        codeN.includes(tn) ||
-        name.includes(t) ||
-        brand.includes(t) ||
-        tags.includes(t)
-      );
-    })
-    .slice(0, 200);
+  // score-based matching:
+  // - richiede che i token "parola" (non numerici) siano presenti nel testo completo
+  // - token numerici migliorano lo score se matchano il code (ma non sono obbligatori)
+  const scored = DB.articles.map(a => {
+    const code = String(a.code || "");
+    const brand = String(a.brand || "");
+    const name = String(a.name || "");
+    const tags = Array.isArray(a.tags) ? a.tags.join(" ") : "";
+
+    const hay = `${code} ${brand} ${name} ${tags}`.toLowerCase();
+    const hayN = normalizeCode(hay);
+    const codeN = normalizeCode(code);
+
+    let score = 0;
+
+    // parola: tutte devono comparire (salvo token troppo corti)
+    for(const t of wordTokens){
+      if(t.length < 2) continue;
+      const tN = normalizeCode(t);
+      const ok = hay.includes(t) || (tN && hayN.includes(tN));
+      if(!ok){
+        return null; // fail hard: parola mancante
+      }
+      score += 5;
+    }
+
+    // numeri: opzionali; se matchano migliorano score
+    for(const n of codeTokens){
+      if(codeN.includes(n)) score += 10;
+      else if(hayN.includes(n)) score += 3;
+    }
+
+    // boost se match perfetto di codice (quando query sembra un codice)
+    const rawN = normalizeCode(raw);
+    if(rawN && codeN === rawN) score += 30;
+
+    return { a, score };
+  }).filter(Boolean);
+
+  scored.sort((x,y)=> y.score - x.score);
+  return scored.slice(0, 200).map(x => x.a);
 }
 
 function renderArticleList(q){
-  const items = searchArticles(q).map(a => ({
+  const found = searchArticles(q);
+  const items = found.map(a => ({
     id: a.id,
     label: `${a.brand ? a.brand + " — " : ""}${a.name}${a.code ? " · " + a.code : ""}`
   }));
   fillSelect(UI.article, items, { placeholder: "— Seleziona articolo —", valueKey:"id", labelKey:"label" });
+  return items.length;
 }
 
 
 // Prefill da querystring (es. ?q=PUMA%20CE...) — apre già l'articolo suggerito ma resta modificabile
+// Prefill da querystring (es. ?q=PUMA%20CE...&fallback=820) — apre già l'articolo suggerito ma resta modificabile
 function prefillFromQuery(){
   const params = new URLSearchParams(location.search);
-  const q = (params.get("q") || "").trim();
+  let q = (params.get("q") || "").trim();
+  const fallback = (params.get("fallback") || "").trim();
+
+  // fallback "interno" (se non passato) — estendibile
+  const FALLBACK_MAP = { "822": "820" };
+
   if(!q) return;
 
-  // imposta ricerca
+  // imposta ricerca + lista
   if(UI.q){
     UI.q.value = q;
-    renderArticleList(q);
+    const n = renderArticleList(q);
+
+    // se non trovo nulla, provo fallback esplicito oppure mappa interna (es. 822 -> 820)
+    if(n === 0){
+      let fb = fallback;
+      if(!fb){
+        const up = q.toUpperCase();
+        for(const k of Object.keys(FALLBACK_MAP)){
+          if(up.includes(k)){
+            fb = FALLBACK_MAP[k];
+            break;
+          }
+        }
+      }
+      if(fb){
+        UI.q.value = fb;
+        renderArticleList(fb);
+      }
+    }
+
+    // forza UI update anche se value è settato via JS
+    try{ UI.q.dispatchEvent(new Event("input", { bubbles:true })); }catch(e){}
   }
 
-  // prova a selezionare automaticamente il primo risultato utile
-  // (placeholder è index 0)
+  // prova a selezionare automaticamente il primo risultato utile (placeholder è index 0)
   setTimeout(() => {
     if(UI.article && UI.article.options && UI.article.options.length > 1){
       UI.article.selectedIndex = 1;
       UI.article.dispatchEvent(new Event("change", { bubbles:true }));
     }
-  }, 30);
+  }, 50);
 }
 
 
