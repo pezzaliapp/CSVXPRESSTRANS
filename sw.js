@@ -1,7 +1,7 @@
 // CSVXPRESSTRANS/sw.js
-// Wrapper per aggiornare più facilmente il service-worker principale anche su device "testardi".
-// Carica service-worker.js con cache-busting.
-const VER = '1.0.3';
+// Wrapper SW: importa service-worker.js con cache-busting per forzare update su iOS/Chrome.
+// Registra SOLO questo file (index.html -> navigator.serviceWorker.register('./sw.js')).
+const VER = '1.0.4';
 importScripts(`./service-worker.js?v=${VER}`);
 
 self.addEventListener('install', () => self.skipWaiting());

@@ -360,8 +360,28 @@ document.addEventListener("DOMContentLoaded", function () {
   bindCsvMemoryUI();
   tryAutoLoadSavedCsvOnStart();
 
-  document.getElementById("csvFileInput").addEventListener("change", handleCSVUpload);
-  document.getElementById("searchListino").addEventListener("input", aggiornaListinoSelect);
+  const _csvIn = document.getElementById("csvFileInput"); if(_csvIn) _csvIn.addEventListener("change", handleCSVUpload);
+  const _sList = document.getElementById("searchListino"); if(_sList) _sList.addEventListener("input", aggiornaListinoSelect);
+
+  // Bottone "Aggiungi Articolo" da listino (se presente in HTML)
+  (function bindAddFromListino(){
+    const host = document.getElementById("listino-section");
+    let btn = document.getElementById("btnAddFromListino");
+    if(!btn && host){
+      // Se non esiste nel DOM, crealo (compatibilità con vecchi index.html)
+      btn = document.createElement("button");
+      btn.id = "btnAddFromListino";
+      btn.type = "button";
+      btn.textContent = "Aggiungi Articolo";
+      host.appendChild(btn);
+    }
+    if(btn){
+      btn.addEventListener("click", function(){
+        try { aggiungiArticoloDaListino(); } catch(e){ console.warn(e); }
+      });
+    }
+  })();
+
 
   // Checkboxes (già presenti)
   const checkbox1 = document.createElement("label");
@@ -376,13 +396,20 @@ document.addEventListener("DOMContentLoaded", function () {
   `;
   document.getElementById("upload-section").appendChild(checkbox2);
 
-  // Bottone manuale
-  const manualButton = document.createElement("button");
-  manualButton.textContent = "Aggiungi Articolo Manualmente";
-  manualButton.onclick = mostraFormArticoloManuale;
-  document.getElementById("listino-section").appendChild(manualButton);
-
-  bindSmartControls();
+  // Bottone manuale (evita duplicazioni se già presente in HTML)
+  (function ensureManualButton(){
+    const host = document.getElementById("listino-section");
+    if(!host) return;
+    let manualButton = document.getElementById("btnAddManual");
+    if(!manualButton){
+      manualButton = document.createElement("button");
+      manualButton.id = "btnAddManual";
+      manualButton.type = "button";
+      manualButton.textContent = "Aggiungi Articolo Manualmente";
+      host.appendChild(manualButton);
+    }
+    manualButton.onclick = mostraFormArticoloManuale;
+  })();bindSmartControls();
 
   // Se l'utente aveva già attivo il flag, applicalo alla tabella caricata
   if (smartSettings.showClientDiscount) applyClientDiscountMode(true);
@@ -800,12 +827,17 @@ function calcolaTrasporto(index){
     if(!a){ return; }
 
     const code = String(a.codice || '').trim();
-    const q = `${a.codice} ${a.descrizione}`.trim();
+    let q = `${a.codice} ${a.descrizione}`.trim();
 
-    // fallback logistico (estendibile)
+    // fallback logistico (estendibile): es. MEC 822 -> MEC 820
+    q = q
+      .replace(/\bMEC\s*822\b/gi, 'MEC 820')
+      .replace(/\b822VDL\b/gi, '820VDL')
+      .replace(/\b822\b/g, '820');
+
     let fallback = '';
     const qU = q.toUpperCase();
-    if(qU.includes('822')) fallback = '820';
+    if(qU.includes('820')) fallback = '820';
 
     const url = `./trasporti/?code=${encodeURIComponent(code)}&q=${encodeURIComponent(q)}&fallback=${encodeURIComponent(fallback)}`;
     window.open(url, '_blank', 'noopener');
